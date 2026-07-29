@@ -1,0 +1,29 @@
+[package]
+name = "dbc-drivers"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+bigdecimal.workspace = true
+chrono.workspace = true
+dbc-core = { path = "../dbc-core" }
+dbc-data = { path = "../dbc-data" }
+futures-util.workspace = true
+mongodb.workspace = true
+redis.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shell-words.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

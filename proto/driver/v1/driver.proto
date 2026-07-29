@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+package dbc.driver.v1;
+
+message HandshakeRequest {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string host_version = 3;
+}
+
+message HandshakeResponse {
+  bool accepted = 1;
+  string plugin_id = 2;
+  string plugin_version = 3;
+  uint32 protocol_major = 4;
+  uint32 protocol_minor = 5;
+  string capabilities_json = 6;
+  optional string rejection_reason = 7;
+}
+
+message ConnectRequest {
+  string request_id = 1;
+  string connection_id = 2;
+  string profile_json = 3;
+  bytes secret = 4;
+}
+
+message QueryRequest {
+  string request_id = 1;
+  string connection_id = 2;
+  string language = 3;
+  string query = 4;
+  uint64 timeout_millis = 5;
+  uint64 row_limit = 6;
+}
+
+message ObjectListRequest {
+  string request_id = 1;
+  string connection_id = 2;
+  repeated string parent_segments = 3;
+  bool include_system = 4;
+  uint64 limit = 5;
+  optional string cursor = 6;
+  uint64 timeout_millis = 7;
+}
+
+enum ExplainMode {
+  EXPLAIN_MODE_UNSPECIFIED = 0;
+  EXPLAIN_MODE_ESTIMATED = 1;
+  EXPLAIN_MODE_ANALYZE = 2;
+}
+
+message ExplainRequest {
+  string request_id = 1;
+  string connection_id = 2;
+  string query = 3;
+  ExplainMode mode = 4;
+  uint64 timeout_millis = 5;
+}
+
+enum SlowQueryOrder {
+  SLOW_QUERY_ORDER_UNSPECIFIED = 0;
+  SLOW_QUERY_ORDER_MEAN_TIME = 1;
+  SLOW_QUERY_ORDER_TOTAL_TIME = 2;
+  SLOW_QUERY_ORDER_CALLS = 3;
+}
+
+message SlowQueryRequest {
+  string request_id = 1;
+  string connection_id = 2;
+  uint64 limit = 3;
+  optional double minimum_mean_time_millis = 4;
+  SlowQueryOrder order = 5;
+  uint64 timeout_millis = 6;
+}
+
+message CancelRequest {
+  string request_id = 1;
+}
+
+message CloseRequest {
+  string request_id = 1;
+  string connection_id = 2;
+}
+
+message ControlRequest {
+  oneof request {
+    HandshakeRequest handshake = 1;
+    ConnectRequest connect = 2;
+    QueryRequest query = 3;
+    CancelRequest cancel = 4;
+    CloseRequest close = 5;
+    ObjectListRequest list_objects = 6;
+    ExplainRequest explain = 7;
+    SlowQueryRequest slow_queries = 8;
+  }
+}
+
+message ControlResponse {
+  string request_id = 1;
+  bool success = 2;
+  optional HandshakeResponse handshake = 3;
+  optional string error_code = 4;
+  optional string error_message = 5;
+}
+
+enum FrameKind {
+  FRAME_KIND_UNSPECIFIED = 0;
+  FRAME_KIND_CONTROL = 1;
+  FRAME_KIND_ARROW_IPC = 2;
+  FRAME_KIND_DOCUMENT_JSON = 3;
+  FRAME_KIND_KEY_VALUE = 4;
+  FRAME_KIND_ERROR = 5;
+  FRAME_KIND_OBJECT_PAGE_JSON = 6;
+  FRAME_KIND_EXECUTION_PLAN_JSON = 7;
+  FRAME_KIND_SLOW_QUERY_PAGE_JSON = 8;
+}
+
+message FrameHeader {
+  string request_id = 1;
+  FrameKind kind = 2;
+  uint64 sequence = 3;
+  bool end_stream = 4;
+  uint64 payload_length = 5;
+}
