@@ -15,6 +15,8 @@ pub enum DriverError {
     Cancelled,
     #[error("query is invalid: {0}")]
     Query(String),
+    #[error("data changed since it was loaded: {0}")]
+    Conflict(String),
     #[error("capability is not supported: {0}")]
     Unsupported(String),
     #[error("plugin protocol error: {0}")]

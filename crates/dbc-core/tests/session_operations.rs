@@ -12,6 +12,7 @@ use dbc_core::{
         DatabaseObject, DatabaseObjectKind, ObjectListRequest, ObjectPage, ObjectPath,
     },
     query::QueryRequest,
+    table_data::TableRef,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -142,11 +143,20 @@ async fn new_session_operations_degrade_to_unsupported_by_default() {
                 order: SlowQueryOrder::MeanTime,
                 timeout: Duration::from_secs(2),
             },
-            cancellation,
+            cancellation.clone(),
         )
         .await
         .expect_err("minimal session should not expose slow queries");
     assert!(matches!(slow_error, DriverError::Unsupported(_)));
+
+    let table_error = session
+        .table_metadata(
+            TableRef::new(["public"], "users"),
+            cancellation,
+        )
+        .await
+        .expect_err("minimal session should not expose editable table data");
+    assert!(matches!(table_error, DriverError::Unsupported(_)));
 }
 
 #[derive(Debug)]

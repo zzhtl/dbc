@@ -41,6 +41,7 @@ pub enum Capability {
     Crud(CrudCapabilities),
     Explain(ExplainCapabilities),
     SlowQueries(SlowQueryCapabilities),
+    TableData,
     SchemaManagement,
     Backup,
     ImportExport,
@@ -89,6 +90,13 @@ impl CapabilitySet {
         self.capabilities
             .iter()
             .any(|capability| matches!(capability, Capability::SlowQueries(_)))
+    }
+
+    #[must_use]
+    pub fn supports_table_data(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|capability| matches!(capability, Capability::TableData))
     }
 
     #[must_use]

@@ -12,9 +12,17 @@ use dbc_core::{
     error::DriverError,
     metadata::{DatabaseObject, DatabaseObjectKind, ObjectListRequest, ObjectPage, ObjectPath},
     query::QueryRequest,
-    sql::{StatementRisk, classify_sql},
+    query_editability::{
+        QueryEditabilityReason, QuerySourceAnalysis, analyze_query_source,
+        resolve_query_editability,
+    },
+    sql::{SqlDialect, StatementRisk, classify_sql},
+    table_data::{
+        FilterOperator, SortDirection, TableApplyResult, TableBrowseRequest, TableChangePlan,
+        TableFilter, TableMetadata, TablePage, TableRef, TableSort,
+    },
 };
-use dbc_data::{BufferLimits, DataSchema, ResultBuffer};
+use dbc_data::{BufferLimits, CellValue, DataSchema, ResultBuffer};
 use dbc_drivers::builtin_factories;
 use dbc_runtime::{RuntimeConfig, TaskError, TaskRuntime};
 use eframe::egui;
@@ -30,7 +38,8 @@ use crate::{
         ExportError, ExportFormat, ExportLimits, ExportSummary, FULL_EXPORT_QUERY_ROWS,
         export_buffer_cancellable, export_query,
     },
-    result_table::{ResultGridState, ResultModel},
+    result_table::{ResultGridState, ResultModel, tabular_cells},
+    table_editor::{EditorOrigin, TableEditorState, input_cell_value},
 };
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -73,6 +82,9 @@ enum OperationKind {
     Explain,
     SlowQueries,
     Export,
+    TableLoad,
+    TablePlan,
+    TableApply,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,8 +172,52 @@ impl BufferedQueryResult {
 
 #[derive(Debug, Clone)]
 struct QuerySnapshot {
+    operation_id: u64,
     language: QueryLanguage,
     text: String,
+    source_analysis: Option<QuerySourceAnalysis>,
+}
+
+struct LoadedTable {
+    metadata: TableMetadata,
+    page: TablePage,
+}
+
+struct PreparedTableChange {
+    editor_generation: u64,
+    revision: u64,
+    plan: TableChangePlan,
+}
+
+#[derive(Debug, Clone)]
+struct TableBrowseControls {
+    table: TableRef,
+    filters: Vec<TableFilter>,
+    raw_where: String,
+    raw_order_by: String,
+    sort_column: String,
+    sort_direction: SortDirection,
+    filter_column: String,
+    filter_operator: FilterOperator,
+    filter_value: String,
+    second_filter_value: String,
+}
+
+impl TableBrowseControls {
+    fn new(table: TableRef) -> Self {
+        Self {
+            table,
+            filters: Vec::new(),
+            raw_where: String::new(),
+            raw_order_by: String::new(),
+            sort_column: String::new(),
+            sort_direction: SortDirection::Ascending,
+            filter_column: String::new(),
+            filter_operator: FilterOperator::Equals,
+            filter_value: String::new(),
+            second_filter_value: String::new(),
+        }
+    }
 }
 
 struct ActiveQueryEvents {
@@ -187,6 +243,12 @@ enum AppEvent {
         operation_id: u64,
         result: DriverTaskResult<()>,
     },
+    QueryMetadataLoaded {
+        session_generation: u64,
+        operation_id: u64,
+        analysis: QuerySourceAnalysis,
+        result: DriverTaskResult<TableMetadata>,
+    },
     ExplainFinished {
         session_generation: u64,
         operation_id: u64,
@@ -203,6 +265,24 @@ enum AppEvent {
         path: PathBuf,
         result: ExportTaskResult,
     },
+    TableLoaded {
+        session_generation: u64,
+        operation_id: u64,
+        result: DriverTaskResult<LoadedTable>,
+    },
+    TablePlanReady {
+        session_generation: u64,
+        operation_id: u64,
+        editor_generation: u64,
+        revision: u64,
+        result: DriverTaskResult<TableChangePlan>,
+    },
+    TableApplied {
+        session_generation: u64,
+        operation_id: u64,
+        editor_generation: u64,
+        result: DriverTaskResult<TableApplyResult>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -211,6 +291,7 @@ struct CapabilitySupport {
     analyze: bool,
     slow_queries: bool,
     crud: bool,
+    table_data: bool,
 }
 
 pub struct DbcApp {
@@ -251,6 +332,12 @@ pub struct DbcApp {
     last_query: Option<QuerySnapshot>,
     left_panel_open: bool,
     right_panel_open: bool,
+    table_editor: Option<TableEditorState>,
+    table_editor_generation: u64,
+    table_browse: Option<TableBrowseControls>,
+    prepared_table_change: Option<PreparedTableChange>,
+    show_table_change_preview: bool,
+    query_read_only_reason: Option<String>,
 }
 
 impl DbcApp {
@@ -308,6 +395,12 @@ impl DbcApp {
             last_query: None,
             left_panel_open: true,
             right_panel_open: true,
+            table_editor: None,
+            table_editor_generation: 0,
+            table_browse: None,
+            prepared_table_change: None,
+            show_table_change_preview: false,
+            query_read_only_reason: None,
         })
     }
 
@@ -322,6 +415,7 @@ impl DbcApp {
                 analyze: false,
                 slow_queries: false,
                 crud: false,
+                table_data: false,
             };
         };
         let capabilities = &factory.descriptor().capabilities;
@@ -338,6 +432,7 @@ impl DbcApp {
             analyze,
             slow_queries: capabilities.supports_slow_queries(),
             crud: capabilities.supports_crud(),
+            table_data: capabilities.supports_table_data(),
         }
     }
 
@@ -346,6 +441,7 @@ impl DbcApp {
             || self.operation_busy
             || index >= DRIVER_CHOICES.len()
             || index == self.selected_driver
+            || !self.allow_pending_navigation("切换驱动")
         {
             return;
         }
@@ -363,7 +459,10 @@ impl DbcApp {
     }
 
     fn connect(&mut self, ctx: &egui::Context) {
-        if self.connection_busy || self.operation_busy {
+        if self.connection_busy
+            || self.operation_busy
+            || !self.allow_pending_navigation("重新连接")
+        {
             return;
         }
         let choice = self.choice();
@@ -409,6 +508,9 @@ impl DbcApp {
     }
 
     fn disconnect(&mut self) {
+        if !self.allow_pending_navigation("断开连接") {
+            return;
+        }
         self.cancel_active_operation();
         self.close_current_session();
         self.connection_busy = false;
@@ -417,7 +519,7 @@ impl DbcApp {
     }
 
     fn execute(&mut self, ctx: &egui::Context) {
-        if self.operation_busy {
+        if self.operation_busy || !self.allow_pending_navigation("执行新查询") {
             return;
         }
         let Some(session) = self.session.clone() else {
@@ -435,20 +537,24 @@ impl DbcApp {
 
         let language = self.choice().language;
         let settings = self.query_settings;
-        self.last_query = Some(QuerySnapshot {
-            language,
-            text: text.clone(),
-        });
+        let source_analysis = (language == QueryLanguage::Sql)
+            .then(|| analyze_query_source(&text, self.sql_dialect()));
         let request = QueryRequest::new(
             Uuid::new_v4(),
             language,
-            text,
+            text.clone(),
             OPERATION_TIMEOUT,
             settings.row_limit,
         );
         let (query_sender, query_receiver) = mpsc::channel(QUERY_EVENT_CHANNEL_CAPACITY);
         let session_generation = self.session_generation;
         let operation_id = self.next_operation_id();
+        self.last_query = Some(QuerySnapshot {
+            operation_id,
+            language,
+            text,
+            source_analysis,
+        });
         let event_sender = self.event_sender.clone();
         let stream_repaint = ctx.clone();
         let completion_repaint = ctx.clone();
@@ -484,6 +590,10 @@ impl DbcApp {
         self.current_page = 0;
         self.current_result = None;
         self.active_result = Some(BufferedQueryResult::new(settings.buffer_limits()));
+        self.table_editor = None;
+        self.table_browse = None;
+        self.invalidate_table_change_plan();
+        self.query_read_only_reason = None;
         self.data_grid
             .replace(ResultModel::message("正在接收查询结果…"));
     }
@@ -750,6 +860,255 @@ impl DbcApp {
         );
     }
 
+    fn allow_pending_navigation(&mut self, action: &str) -> bool {
+        let pending = self
+            .table_editor
+            .as_ref()
+            .map_or(0, TableEditorState::pending_change_count);
+        if pending == 0 {
+            return true;
+        }
+        self.status = format!(
+            "有 {pending} 行未保存变更；请先应用或放弃变更，再{action}"
+        );
+        false
+    }
+
+    fn sql_dialect(&self) -> SqlDialect {
+        match self.choice().id {
+            "postgresql" => SqlDialect::PostgreSql,
+            "mysql" => SqlDialect::MySql,
+            "sqlite" => SqlDialect::SQLite,
+            _ => SqlDialect::Generic,
+        }
+    }
+
+    fn open_table(&mut self, table: TableRef, ctx: &egui::Context) {
+        if self.operation_busy
+            || !self.capability_support().table_data
+            || !self.allow_pending_navigation("打开其他对象")
+        {
+            return;
+        }
+        self.table_browse = Some(TableBrowseControls::new(table));
+        self.table_editor = None;
+        self.current_result = None;
+        self.active_result = None;
+        self.last_query = None;
+        self.query_read_only_reason = None;
+        self.invalidate_table_change_plan();
+        self.load_active_table_page(0, ctx);
+    }
+
+    fn load_active_table_page(&mut self, page_index: u64, ctx: &egui::Context) {
+        if self.operation_busy || !self.allow_pending_navigation("重新加载数据") {
+            return;
+        }
+        let Some(session) = self.session.clone() else {
+            self.status = "请先建立数据库连接".to_owned();
+            return;
+        };
+        let Some(controls) = self.table_browse.clone() else {
+            return;
+        };
+        let page_size = match u32::try_from(self.query_settings.page_size) {
+            Ok(page_size) => page_size,
+            Err(_) => {
+                self.status = "分页大小超出驱动支持范围".to_owned();
+                return;
+            }
+        };
+        let sort = (!controls.sort_column.is_empty()).then(|| {
+            vec![TableSort {
+                column: controls.sort_column.clone(),
+                direction: controls.sort_direction,
+            }]
+        });
+        let table_name = controls.table.name.clone();
+        let request = TableBrowseRequest {
+            id: Uuid::new_v4(),
+            table: controls.table.clone(),
+            filters: controls.filters,
+            sort,
+            raw_where: optional_input(&controls.raw_where),
+            raw_order_by: optional_input(&controls.raw_order_by),
+            page_index,
+            page_size,
+            timeout: OPERATION_TIMEOUT,
+        };
+        let table = controls.table;
+        let session_generation = self.session_generation;
+        let operation_id = self.next_operation_id();
+        let event_sender = self.event_sender.clone();
+        let repaint = ctx.clone();
+        let cancellation = self.runtime.spawn_reported(
+            move |task_cancellation| async move {
+                let metadata = session
+                    .table_metadata(table, task_cancellation.clone())
+                    .await?;
+                let page = session
+                    .browse_table(request, task_cancellation)
+                    .await?;
+                Ok::<LoadedTable, DriverError>(LoadedTable { metadata, page })
+            },
+            move |result| {
+                let _sent = event_sender.send(AppEvent::TableLoaded {
+                    session_generation,
+                    operation_id,
+                    result,
+                });
+                repaint.request_repaint();
+            },
+        );
+        self.begin_operation(operation_id, OperationKind::TableLoad, cancellation);
+        self.result_tab = ResultTab::Data;
+        self.status = format!("正在读取 {table_name} 第 {} 页…", page_index + 1);
+    }
+
+    fn prepare_query_editor(&mut self, operation_id: u64, ctx: &egui::Context) {
+        let Some(snapshot) = self
+            .last_query
+            .as_ref()
+            .filter(|snapshot| snapshot.operation_id == operation_id)
+        else {
+            return;
+        };
+        let Some(analysis) = snapshot.source_analysis.clone() else {
+            self.query_read_only_reason = Some("当前查询语言不支持表格式编辑".to_owned());
+            return;
+        };
+        if let Some(reason) = analysis.reason {
+            self.query_read_only_reason =
+                Some(query_editability_reason_label(reason).to_owned());
+            return;
+        }
+        let Some(table) = analysis.table.clone() else {
+            self.query_read_only_reason = Some("无法确定查询的数据源表".to_owned());
+            return;
+        };
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let session_generation = self.session_generation;
+        let event_sender = self.event_sender.clone();
+        let repaint = ctx.clone();
+        let _cancellation = self.runtime.spawn_reported(
+            move |task_cancellation| async move {
+                session.table_metadata(table, task_cancellation).await
+            },
+            move |result| {
+                let _sent = event_sender.send(AppEvent::QueryMetadataLoaded {
+                    session_generation,
+                    operation_id,
+                    analysis,
+                    result,
+                });
+                repaint.request_repaint();
+            },
+        );
+    }
+
+    fn preview_table_changes(&mut self, ctx: &egui::Context) {
+        if self.operation_busy {
+            return;
+        }
+        let Some(session) = self.session.clone() else {
+            self.status = "数据库连接已断开".to_owned();
+            return;
+        };
+        let Some(editor) = self.table_editor.as_ref() else {
+            return;
+        };
+        let request = match editor.change_request(OPERATION_TIMEOUT) {
+            Ok(request) if !request.is_empty() => request,
+            Ok(_) => {
+                self.status = "没有待提交的表数据变更".to_owned();
+                return;
+            }
+            Err(error) => {
+                self.status = format!("无法生成变更：{error}");
+                return;
+            }
+        };
+        let editor_generation = self.table_editor_generation;
+        let revision = editor.revision();
+        let session_generation = self.session_generation;
+        let operation_id = self.next_operation_id();
+        let event_sender = self.event_sender.clone();
+        let repaint = ctx.clone();
+        let cancellation = self.runtime.spawn_reported(
+            move |task_cancellation| async move {
+                session
+                    .plan_table_changes(request, task_cancellation)
+                    .await
+            },
+            move |result| {
+                let _sent = event_sender.send(AppEvent::TablePlanReady {
+                    session_generation,
+                    operation_id,
+                    editor_generation,
+                    revision,
+                    result,
+                });
+                repaint.request_repaint();
+            },
+        );
+        self.begin_operation(operation_id, OperationKind::TablePlan, cancellation);
+        self.status = "正在生成参数化 SQL 预览…".to_owned();
+    }
+
+    fn apply_prepared_table_changes(&mut self, ctx: &egui::Context) {
+        if self.operation_busy {
+            return;
+        }
+        let Some(prepared) = self.prepared_table_change.as_ref() else {
+            return;
+        };
+        let Some(editor) = self.table_editor.as_ref() else {
+            return;
+        };
+        if prepared.editor_generation != self.table_editor_generation
+            || prepared.revision != editor.revision()
+        {
+            self.invalidate_table_change_plan();
+            self.status = "数据已继续修改，请重新生成 SQL 预览".to_owned();
+            return;
+        }
+        let Some(session) = self.session.clone() else {
+            self.status = "数据库连接已断开".to_owned();
+            return;
+        };
+        let plan = prepared.plan.clone();
+        let editor_generation = prepared.editor_generation;
+        let session_generation = self.session_generation;
+        let operation_id = self.next_operation_id();
+        let event_sender = self.event_sender.clone();
+        let repaint = ctx.clone();
+        let cancellation = self.runtime.spawn_reported(
+            move |task_cancellation| async move {
+                session
+                    .apply_table_changes(plan, task_cancellation)
+                    .await
+            },
+            move |result| {
+                let _sent = event_sender.send(AppEvent::TableApplied {
+                    session_generation,
+                    operation_id,
+                    editor_generation,
+                    result,
+                });
+                repaint.request_repaint();
+            },
+        );
+        self.begin_operation(operation_id, OperationKind::TableApply, cancellation);
+        self.status = "正在原子提交表数据变更…".to_owned();
+    }
+
+    fn invalidate_table_change_plan(&mut self) {
+        self.prepared_table_change = None;
+        self.show_table_change_preview = false;
+    }
+
     fn activate_object(&mut self, index: usize, ctx: &egui::Context) {
         let Some(row) = self.objects.get(index).cloned() else {
             return;
@@ -840,6 +1199,11 @@ impl DbcApp {
                 format!("查询已取消 · 已保留 {rows} 行")
             }
             Some(OperationKind::Export) => "导出已取消，目标文件不会被替换".to_owned(),
+            Some(OperationKind::TableLoad) => "表数据加载已取消".to_owned(),
+            Some(OperationKind::TablePlan) => "SQL 预览生成已取消".to_owned(),
+            Some(OperationKind::TableApply) => {
+                "表数据提交已取消，事务已回滚".to_owned()
+            }
             Some(OperationKind::Explain | OperationKind::SlowQueries) | None => {
                 "操作已取消".to_owned()
             }
@@ -871,6 +1235,10 @@ impl DbcApp {
         self.current_page = 0;
         self.last_query = None;
         self.query_events = None;
+        self.table_editor = None;
+        self.table_browse = None;
+        self.invalidate_table_change_plan();
+        self.query_read_only_reason = None;
         self.data_grid.replace(ResultModel::message(
             "连接数据库后执行查询，结果将在这里显示",
         ));
@@ -968,16 +1336,36 @@ impl DbcApp {
         }
     }
 
-    fn set_page_size(&mut self, page_size: usize) {
+    fn set_page_size(&mut self, page_size: usize, ctx: &egui::Context) {
         if !PAGE_SIZE_PRESETS.contains(&page_size) || page_size == self.query_settings.page_size {
+            return;
+        }
+        if !self.allow_pending_navigation("切换分页大小") {
             return;
         }
         let previous_page_size = self.query_settings.page_size;
         self.query_settings.page_size = page_size;
         self.current_page =
             page_after_page_size_change(self.current_page, previous_page_size, page_size);
-        self.refresh_data_grid();
-        self.status = format!("每页显示已切换为 {page_size} 行");
+        if self
+            .table_editor
+            .as_ref()
+            .is_some_and(|editor| editor.origin() == EditorOrigin::Table)
+        {
+            let previous_page = self
+                .table_editor
+                .as_ref()
+                .map_or(0, TableEditorState::page_index);
+            let first_row = previous_page.saturating_mul(
+                u64::try_from(previous_page_size).unwrap_or(u64::MAX),
+            );
+            let new_page =
+                first_row / u64::try_from(page_size).unwrap_or(u64::MAX);
+            self.load_active_table_page(new_page, ctx);
+        } else {
+            self.refresh_data_grid();
+            self.status = format!("每页显示已切换为 {page_size} 行");
+        }
     }
 
     fn set_row_limit(&mut self, row_limit: usize) {
@@ -1118,6 +1506,7 @@ impl DbcApp {
                     Ok(()) => {
                         self.status = self.query_completion_status();
                         self.refresh_data_grid();
+                        self.prepare_query_editor(operation_id, ctx);
                     }
                     Err(error) if buffered_rows == 0 => {
                         self.data_grid
@@ -1133,6 +1522,65 @@ impl DbcApp {
                         self.refresh_data_grid();
                     }
                 }
+            }
+            AppEvent::QueryMetadataLoaded {
+                session_generation,
+                operation_id,
+                analysis,
+                result,
+            } => {
+                if session_generation != self.session_generation
+                    || self
+                        .last_query
+                        .as_ref()
+                        .is_none_or(|snapshot| snapshot.operation_id != operation_id)
+                {
+                    return;
+                }
+                let metadata = match result {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        self.query_read_only_reason =
+                            Some(format!("查询结果只读：无法读取行标识元数据（{error}）"));
+                        return;
+                    }
+                };
+                let Some(result) = self.current_result.as_deref() else {
+                    return;
+                };
+                let Some((columns, rows)) = tabular_cells(
+                    result.schema.as_ref(),
+                    result.buffer.batches(),
+                ) else {
+                    self.query_read_only_reason =
+                        Some("查询结果不是可编辑的关系型表格".to_owned());
+                    return;
+                };
+                let editability =
+                    resolve_query_editability(&analysis, &metadata, &columns);
+                if !editability.editable {
+                    self.query_read_only_reason = Some(
+                        editability
+                            .reason
+                            .map(query_editability_reason_label)
+                            .unwrap_or("查询结果没有可编辑的直接列")
+                            .to_owned(),
+                    );
+                    return;
+                }
+                let page_size =
+                    u32::try_from(self.query_settings.page_size).unwrap_or(u32::MAX);
+                self.table_editor = Some(TableEditorState::from_query(
+                    metadata,
+                    editability,
+                    columns,
+                    rows,
+                    page_size,
+                ));
+                self.table_editor_generation =
+                    self.table_editor_generation.wrapping_add(1);
+                self.query_read_only_reason = None;
+                self.invalidate_table_change_plan();
             }
             AppEvent::ExplainFinished {
                 session_generation,
@@ -1229,6 +1677,152 @@ impl DbcApp {
                         format!("导出任务失败：{error}")
                     }
                 };
+            }
+            AppEvent::TableLoaded {
+                session_generation,
+                operation_id,
+                result,
+            } => {
+                if !event_is_current(
+                    self.session_generation,
+                    self.active_operation_id,
+                    session_generation,
+                    operation_id,
+                ) {
+                    return;
+                }
+                self.finish_operation();
+                match result {
+                    Ok(loaded) => {
+                        if let Some(controls) = self.table_browse.as_mut()
+                            && controls.filter_column.is_empty()
+                        {
+                            controls.filter_column = loaded
+                                .metadata
+                                .columns
+                                .first()
+                                .map_or_else(String::new, |column| column.name.clone());
+                        }
+                        let name = loaded.metadata.table.name.clone();
+                        let total = loaded.page.total_rows;
+                        let page = loaded.page.page_index;
+                        self.table_editor = Some(TableEditorState::from_table(
+                            loaded.metadata,
+                            loaded.page,
+                        ));
+                        self.table_editor_generation =
+                            self.table_editor_generation.wrapping_add(1);
+                        self.invalidate_table_change_plan();
+                        self.query_read_only_reason = None;
+                        self.status = format!(
+                            "已读取 {name} · 第 {} 页 · 精确统计 {total} 行",
+                            page + 1
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("表数据加载失败：{error}");
+                    }
+                }
+            }
+            AppEvent::TablePlanReady {
+                session_generation,
+                operation_id,
+                editor_generation,
+                revision,
+                result,
+            } => {
+                if !event_is_current(
+                    self.session_generation,
+                    self.active_operation_id,
+                    session_generation,
+                    operation_id,
+                ) {
+                    return;
+                }
+                self.finish_operation();
+                if editor_generation != self.table_editor_generation
+                    || self
+                        .table_editor
+                        .as_ref()
+                        .is_none_or(|editor| editor.revision() != revision)
+                {
+                    self.status = "数据已继续修改，请重新生成 SQL 预览".to_owned();
+                    return;
+                }
+                match result {
+                    Ok(plan) => {
+                        let count = plan.statements.len();
+                        self.prepared_table_change = Some(PreparedTableChange {
+                            editor_generation,
+                            revision,
+                            plan,
+                        });
+                        self.show_table_change_preview = true;
+                        self.status = format!("已生成 {count} 条参数化变更语句");
+                    }
+                    Err(error) => {
+                        self.status = format!("SQL 预览生成失败：{error}");
+                    }
+                }
+            }
+            AppEvent::TableApplied {
+                session_generation,
+                operation_id,
+                editor_generation,
+                result,
+            } => {
+                if !event_is_current(
+                    self.session_generation,
+                    self.active_operation_id,
+                    session_generation,
+                    operation_id,
+                ) || editor_generation != self.table_editor_generation
+                {
+                    return;
+                }
+                self.finish_operation();
+                match result {
+                    Ok(applied) => {
+                        let origin = self
+                            .table_editor
+                            .as_ref()
+                            .map(TableEditorState::origin);
+                        let page = self
+                            .table_editor
+                            .as_ref()
+                            .map_or(0, TableEditorState::page_index);
+                        self.table_editor = None;
+                        self.invalidate_table_change_plan();
+                        self.status = format!(
+                            "提交完成 · 新增 {} · 更新 {} · 删除 {}",
+                            applied.summary.inserted,
+                            applied.summary.updated,
+                            applied.summary.deleted
+                        );
+                        match origin {
+                            Some(EditorOrigin::Table) => {
+                                self.load_active_table_page(page, ctx);
+                            }
+                            Some(EditorOrigin::Query) => {
+                                if let Some(snapshot) = self.last_query.as_ref() {
+                                    self.query_text.clone_from(&snapshot.text);
+                                }
+                                self.execute(ctx);
+                            }
+                            None => {}
+                        }
+                    }
+                    Err(error) => {
+                        self.invalidate_table_change_plan();
+                        self.status = match &error {
+                            TaskError::Operation(DriverError::Conflict(_)) => {
+                                "提交冲突：数据已被其他事务修改；请放弃变更并重新加载"
+                                    .to_owned()
+                            }
+                            _ => format!("表数据提交失败：{error}"),
+                        };
+                    }
+                }
             }
         }
     }
@@ -1364,6 +1958,7 @@ impl DbcApp {
                     return;
                 }
                 let mut activated = None;
+                let mut opened_table = None;
                 for index in self.visible_object_indices() {
                     let row = &self.objects[index];
                     let key = object_path_key(Some(&row.object.path));
@@ -1387,16 +1982,23 @@ impl DbcApp {
                     );
                     ui.horizontal(|ui| {
                         ui.add_space(row.depth as f32 * 16.0);
-                        if ui
+                        let response = ui
                             .add(egui::Button::new(label).frame(false).selected(expanded))
-                            .on_hover_text(object_kind_label(&row.object.kind))
-                            .clicked()
-                        {
+                            .on_hover_text(if object_table_ref(&row.object).is_some() {
+                                "双击打开数据；单击展开对象"
+                            } else {
+                                object_kind_label(&row.object.kind)
+                            });
+                        if response.double_clicked() {
+                            opened_table = object_table_ref(&row.object);
+                        } else if response.clicked() {
                             activated = Some(index);
                         }
                     });
                 }
-                if let Some(index) = activated {
+                if let Some(table) = opened_table {
+                    self.open_table(table, ui.ctx());
+                } else if let Some(index) = activated {
                     self.activate_object(index, ui.ctx());
                 }
             });
@@ -1485,7 +2087,7 @@ impl DbcApp {
             });
 
         if page_size != self.query_settings.page_size {
-            self.set_page_size(page_size);
+            self.set_page_size(page_size, ui.ctx());
         }
         if row_limit != self.query_settings.row_limit {
             self.set_row_limit(row_limit);
@@ -1514,6 +2116,203 @@ impl DbcApp {
         editor.show(ui, &mut self.query_text, &syntax);
     }
 
+    fn render_table_browser_controls(&mut self, ui: &mut egui::Ui) {
+        let columns = self
+            .table_editor
+            .as_ref()
+            .map(|editor| {
+                editor
+                    .metadata()
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut add_filter = false;
+        let mut remove_filter = None;
+        let mut reload = false;
+        let Some(controls) = self.table_browse.as_mut() else {
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            ui.strong("结构化筛选");
+            egui::ComboBox::from_id_salt("table-filter-column")
+                .selected_text(if controls.filter_column.is_empty() {
+                    "选择列"
+                } else {
+                    controls.filter_column.as_str()
+                })
+                .show_ui(ui, |ui| {
+                    for column in &columns {
+                        ui.selectable_value(
+                            &mut controls.filter_column,
+                            column.clone(),
+                            column,
+                        );
+                    }
+                });
+            egui::ComboBox::from_id_salt("table-filter-operator")
+                .selected_text(filter_operator_label(controls.filter_operator))
+                .show_ui(ui, |ui| {
+                    for operator in FILTER_OPERATORS {
+                        ui.selectable_value(
+                            &mut controls.filter_operator,
+                            *operator,
+                            filter_operator_label(*operator),
+                        );
+                    }
+                });
+            if filter_operator_value_count(controls.filter_operator) > 0 {
+                ui.add(
+                    egui::TextEdit::singleline(&mut controls.filter_value)
+                        .hint_text("值")
+                        .desired_width(120.0),
+                );
+            }
+            if filter_operator_value_count(controls.filter_operator) == 2 {
+                ui.add(
+                    egui::TextEdit::singleline(&mut controls.second_filter_value)
+                        .hint_text("第二个值")
+                        .desired_width(120.0),
+                );
+            }
+            if ui.small_button("添加").clicked() {
+                add_filter = true;
+            }
+            ui.separator();
+            egui::ComboBox::from_id_salt("table-sort-column")
+                .selected_text(if controls.sort_column.is_empty() {
+                    "稳定键排序"
+                } else {
+                    controls.sort_column.as_str()
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut controls.sort_column,
+                        String::new(),
+                        "稳定键排序",
+                    );
+                    for column in &columns {
+                        ui.selectable_value(
+                            &mut controls.sort_column,
+                            column.clone(),
+                            column,
+                        );
+                    }
+                });
+            ui.selectable_value(
+                &mut controls.sort_direction,
+                SortDirection::Ascending,
+                "升序",
+            );
+            ui.selectable_value(
+                &mut controls.sort_direction,
+                SortDirection::Descending,
+                "降序",
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.strong("原始片段");
+            ui.add(
+                egui::TextEdit::singleline(&mut controls.raw_where)
+                    .hint_text("WHERE（不含 WHERE）")
+                    .desired_width(240.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut controls.raw_order_by)
+                    .hint_text("ORDER BY（不含 ORDER BY）")
+                    .desired_width(240.0),
+            );
+            if ui
+                .add_enabled(!self.operation_busy, egui::Button::new("重新加载"))
+                .clicked()
+            {
+                reload = true;
+            }
+        });
+        if !controls.filters.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("已启用：");
+                for (index, filter) in controls.filters.iter().enumerate() {
+                    let label = format!(
+                        "{} {} {}",
+                        filter.column,
+                        filter_operator_label(filter.operator),
+                        filter_values_label(&filter.values)
+                    );
+                    if ui.small_button(format!("{label} ×")).clicked() {
+                        remove_filter = Some(index);
+                    }
+                }
+            });
+        }
+
+        if add_filter {
+            self.add_structured_filter();
+        }
+        if let Some(index) = remove_filter
+            && let Some(controls) = self.table_browse.as_mut()
+            && index < controls.filters.len()
+        {
+            controls.filters.remove(index);
+        }
+        if reload {
+            self.load_active_table_page(0, ui.ctx());
+        }
+    }
+
+    fn add_structured_filter(&mut self) {
+        let Some(controls) = self.table_browse.as_ref() else {
+            return;
+        };
+        let column_name = controls.filter_column.clone();
+        let operator = controls.filter_operator;
+        let first = controls.filter_value.clone();
+        let second = controls.second_filter_value.clone();
+        let Some(column) = self
+            .table_editor
+            .as_ref()
+            .and_then(|editor| editor.metadata().column(&column_name))
+        else {
+            self.status = "请先选择筛选列".to_owned();
+            return;
+        };
+        let parse = |value: &str| input_cell_value(&column.database_type, value);
+        let values = match operator {
+            FilterOperator::IsNull | FilterOperator::IsNotNull => Ok(Vec::new()),
+            FilterOperator::Between | FilterOperator::NotBetween => {
+                parse(&first).and_then(|first| {
+                    parse(&second).map(|second| vec![first, second])
+                })
+            }
+            FilterOperator::In | FilterOperator::NotIn => first
+                .split(',')
+                .map(str::trim)
+                .map(parse)
+                .collect::<Result<Vec<_>, _>>(),
+            _ => parse(&first).map(|value| vec![value]),
+        };
+        let values = match values {
+            Ok(values) => values,
+            Err(error) => {
+                self.status = format!("筛选值无效：{error}");
+                return;
+            }
+        };
+        if let Some(controls) = self.table_browse.as_mut() {
+            controls.filters.push(TableFilter {
+                column: column_name,
+                operator,
+                values,
+            });
+            controls.filter_value.clear();
+            controls.second_filter_value.clear();
+        }
+        self.status = "筛选条件已添加；点击“重新加载”生效".to_owned();
+    }
+
     fn render_results(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("result-tabs")
             .exact_size(34.0)
@@ -1525,6 +2324,18 @@ impl DbcApp {
                 });
             });
 
+        let show_table_browser = self
+            .table_editor
+            .as_ref()
+            .is_some_and(|editor| editor.origin() == EditorOrigin::Table);
+        if self.result_tab == ResultTab::Data && show_table_browser {
+            egui::Panel::top("table-browser-controls")
+                .exact_size(110.0)
+                .show(ui, |ui| {
+                    self.render_table_browser_controls(ui);
+                });
+        }
+
         if self.result_tab == ResultTab::Data {
             egui::Panel::bottom("result-pagination")
                 .exact_size(36.0)
@@ -1534,7 +2345,19 @@ impl DbcApp {
         }
 
         egui::CentralPanel::no_frame().show(ui, |ui| match self.result_tab {
-            ResultTab::Data => self.data_grid.show(ui, "data-grid"),
+            ResultTab::Data => {
+                if let Some(editor) = self.table_editor.as_mut() {
+                    if editor.show(
+                        ui,
+                        self.current_page,
+                        self.query_settings.page_size,
+                    ) {
+                        self.invalidate_table_change_plan();
+                    }
+                } else {
+                    self.data_grid.show(ui, "data-grid");
+                }
+            }
             ResultTab::SlowQueries => self.slow_grid.show(ui, "slow-query-grid"),
             ResultTab::Plan => {
                 egui::ScrollArea::both()
@@ -1550,6 +2373,10 @@ impl DbcApp {
     }
 
     fn render_result_controls(&mut self, ui: &mut egui::Ui) {
+        if self.table_editor.is_some() {
+            self.render_editable_result_controls(ui);
+            return;
+        }
         let result_rows = self
             .active_result
             .as_ref()
@@ -1588,6 +2415,10 @@ impl DbcApp {
                 result_pages,
                 result_rows
             ));
+            if let Some(reason) = &self.query_read_only_reason {
+                ui.separator();
+                ui.weak(reason);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_enabled_ui(can_export_full, |ui| {
                     ui.menu_button("完整导出", |ui| {
@@ -1618,6 +2449,209 @@ impl DbcApp {
 
         if let Some((scope, format)) = export {
             self.request_export(scope, format, ui.ctx());
+        }
+    }
+
+    fn render_editable_result_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(editor) = self.table_editor.as_ref() else {
+            return;
+        };
+        let origin = editor.origin();
+        let pending = editor.pending_change_count();
+        let allow_insert = editor.allow_insert();
+        let read_only_reason = editor.read_only_reason().map(str::to_owned);
+        let (page_index, page_count, total_rows) = match origin {
+            EditorOrigin::Table => {
+                let page_size = u64::from(editor.page_size()).max(1);
+                let total = editor.total_rows();
+                (
+                    editor.page_index(),
+                    total.div_ceil(page_size).max(1),
+                    total,
+                )
+            }
+            EditorOrigin::Query => {
+                let total = editor.total_rows();
+                let pages = u64::try_from(page_count(
+                    usize::try_from(total).unwrap_or(usize::MAX),
+                    self.query_settings.page_size,
+                ))
+                .unwrap_or(u64::MAX);
+                (
+                    u64::try_from(self.current_page).unwrap_or(u64::MAX),
+                    pages,
+                    total,
+                )
+            }
+        };
+        let mut previous = false;
+        let mut next = false;
+        let mut add = false;
+        let mut discard = false;
+        let mut preview = false;
+
+        ui.horizontal_centered(|ui| {
+            if ui
+                .add_enabled(page_index > 0 && !self.operation_busy, egui::Button::new("上一页"))
+                .clicked()
+            {
+                previous = true;
+            }
+            if ui
+                .add_enabled(
+                    page_index + 1 < page_count && !self.operation_busy,
+                    egui::Button::new("下一页"),
+                )
+                .clicked()
+            {
+                next = true;
+            }
+            ui.weak(format!(
+                "第 {} / {} 页 · {} 行",
+                page_index + 1,
+                page_count,
+                total_rows
+            ));
+            if let Some(reason) = &read_only_reason {
+                ui.separator();
+                ui.weak(reason);
+            }
+            if let Some(reason) = &self.query_read_only_reason {
+                ui.separator();
+                ui.weak(reason);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        pending > 0 && !self.operation_busy,
+                        egui::Button::new(format!("SQL 预览并应用 ({pending})")),
+                    )
+                    .clicked()
+                {
+                    preview = true;
+                }
+                if ui
+                    .add_enabled(pending > 0, egui::Button::new("放弃变更"))
+                    .clicked()
+                {
+                    discard = true;
+                }
+                if ui
+                    .add_enabled(
+                        allow_insert && !self.operation_busy,
+                        egui::Button::new("新增行"),
+                    )
+                    .clicked()
+                {
+                    add = true;
+                }
+            });
+        });
+
+        if previous && self.allow_pending_navigation("切换页面") {
+            match origin {
+                EditorOrigin::Table => {
+                    self.load_active_table_page(page_index.saturating_sub(1), ui.ctx());
+                }
+                EditorOrigin::Query => self.previous_page(),
+            }
+        }
+        if next && self.allow_pending_navigation("切换页面") {
+            match origin {
+                EditorOrigin::Table => {
+                    self.load_active_table_page(page_index.saturating_add(1), ui.ctx());
+                }
+                EditorOrigin::Query => self.next_page(),
+            }
+        }
+        if add
+            && self
+                .table_editor
+                .as_mut()
+                .is_some_and(TableEditorState::add_row)
+        {
+            self.invalidate_table_change_plan();
+        }
+        if discard {
+            if let Some(editor) = self.table_editor.as_mut() {
+                editor.discard_changes();
+            }
+            self.invalidate_table_change_plan();
+            self.status = "已放弃未提交的表数据变更".to_owned();
+        }
+        if preview {
+            self.preview_table_changes(ui.ctx());
+        }
+    }
+
+    fn render_table_change_preview(&mut self, ctx: &egui::Context) {
+        if !self.show_table_change_preview {
+            return;
+        }
+        let Some(prepared) = self.prepared_table_change.as_ref() else {
+            self.show_table_change_preview = false;
+            return;
+        };
+        let statements = prepared.plan.statements.clone();
+        let summary = prepared.plan.summary;
+        let mut open = self.show_table_change_preview;
+        let mut apply = false;
+        egui::Window::new("参数化 SQL 预览")
+            .id(egui::Id::new("table-change-preview"))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(720.0)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "将原子提交：新增 {}，更新 {}，删除 {}",
+                    summary.inserted, summary.updated, summary.deleted
+                ));
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(420.0)
+                    .show(ui, |ui| {
+                        for (statement_index, statement) in statements.iter().enumerate() {
+                            ui.strong(format!(
+                                "{}. {:?}",
+                                statement_index + 1,
+                                statement.kind
+                            ));
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&statement.sql).monospace(),
+                                )
+                                .selectable(true)
+                                .wrap(),
+                            );
+                            for (parameter_index, parameter) in
+                                statement.parameters.iter().enumerate()
+                            {
+                                ui.monospace(format!(
+                                    "  [{}] {} = {}",
+                                    parameter_index + 1,
+                                    parameter.database_type,
+                                    parameter_value_label(&parameter.value)
+                                ));
+                            }
+                            ui.add_space(10.0);
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.operation_busy, egui::Button::new("确认应用"))
+                        .clicked()
+                    {
+                        apply = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        self.show_table_change_preview = false;
+                    }
+                });
+            });
+        self.show_table_change_preview = open;
+        if apply {
+            self.apply_prepared_table_changes(ctx);
         }
     }
 
@@ -1677,6 +2711,7 @@ impl DbcApp {
         capability_card(ui, "当前驱动", self.choice().name);
         capability_card(ui, "查询语言", &languages);
         capability_card(ui, "CRUD", yes_no(capabilities.crud));
+        capability_card(ui, "表数据编辑", yes_no(capabilities.table_data));
         capability_card(ui, "执行计划", yes_no(capabilities.explain));
         capability_card(ui, "慢查询", yes_no(capabilities.slow_queries));
         ui.add_space(12.0);
@@ -1726,6 +2761,7 @@ impl eframe::App for DbcApp {
         egui::CentralPanel::no_frame().show(ui, |ui| {
             self.render_workspace(ui);
         });
+        self.render_table_change_preview(ui.ctx());
     }
 }
 
@@ -1736,6 +2772,132 @@ fn optional_input(value: &str) -> Option<String> {
 fn object_path_key(path: Option<&ObjectPath>) -> String {
     path.map(|path| path.segments.join("\u{1f}"))
         .unwrap_or_default()
+}
+
+const FILTER_OPERATORS: &[FilterOperator] = &[
+    FilterOperator::Equals,
+    FilterOperator::NotEquals,
+    FilterOperator::GreaterThan,
+    FilterOperator::GreaterThanOrEqual,
+    FilterOperator::LessThan,
+    FilterOperator::LessThanOrEqual,
+    FilterOperator::Like,
+    FilterOperator::NotLike,
+    FilterOperator::In,
+    FilterOperator::NotIn,
+    FilterOperator::Between,
+    FilterOperator::NotBetween,
+    FilterOperator::IsNull,
+    FilterOperator::IsNotNull,
+];
+
+fn object_table_ref(object: &DatabaseObject) -> Option<TableRef> {
+    if !matches!(
+        object.kind,
+        DatabaseObjectKind::Table
+            | DatabaseObjectKind::PartitionedTable
+            | DatabaseObjectKind::View
+            | DatabaseObjectKind::MaterializedView
+            | DatabaseObjectKind::ForeignTable
+    ) {
+        return None;
+    }
+    let mut segments = object.path.segments.clone();
+    let name = segments.pop()?;
+    Some(TableRef::new(segments, name))
+}
+
+const fn filter_operator_label(operator: FilterOperator) -> &'static str {
+    match operator {
+        FilterOperator::Equals => "=",
+        FilterOperator::NotEquals => "≠",
+        FilterOperator::GreaterThan => ">",
+        FilterOperator::GreaterThanOrEqual => "≥",
+        FilterOperator::LessThan => "<",
+        FilterOperator::LessThanOrEqual => "≤",
+        FilterOperator::Like => "LIKE",
+        FilterOperator::NotLike => "NOT LIKE",
+        FilterOperator::In => "IN",
+        FilterOperator::NotIn => "NOT IN",
+        FilterOperator::Between => "BETWEEN",
+        FilterOperator::NotBetween => "NOT BETWEEN",
+        FilterOperator::IsNull => "IS NULL",
+        FilterOperator::IsNotNull => "IS NOT NULL",
+    }
+}
+
+const fn filter_operator_value_count(operator: FilterOperator) -> usize {
+    match operator {
+        FilterOperator::IsNull | FilterOperator::IsNotNull => 0,
+        FilterOperator::Between | FilterOperator::NotBetween => 2,
+        _ => 1,
+    }
+}
+
+fn filter_values_label(values: &[CellValue]) -> String {
+    values
+        .iter()
+        .map(compact_cell_value_label)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parameter_value_label(value: &CellValue) -> String {
+    match value {
+        CellValue::Null => "NULL".to_owned(),
+        CellValue::Default => "DEFAULT".to_owned(),
+        CellValue::Binary(bytes) => {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut value =
+                String::with_capacity(bytes.len().saturating_mul(2).saturating_add(2));
+            value.push_str("0x");
+            for byte in bytes {
+                value.push(char::from(HEX[usize::from(byte >> 4)]));
+                value.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+            value
+        }
+        CellValue::Text(value) => format!("{value:?}"),
+    }
+}
+
+fn compact_cell_value_label(value: &CellValue) -> String {
+    let mut label = parameter_value_label(value);
+    const LIMIT: usize = 80;
+    if label.len() > LIMIT {
+        let mut boundary = LIMIT;
+        while !label.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        label.truncate(boundary);
+        label.push('…');
+    }
+    label
+}
+
+const fn query_editability_reason_label(reason: QueryEditabilityReason) -> &'static str {
+    match reason {
+        QueryEditabilityReason::InvalidSql => "查询结果只读：SQL 无法解析",
+        QueryEditabilityReason::MultipleStatements => "查询结果只读：包含多条 SQL 语句",
+        QueryEditabilityReason::NotAQuery => "查询结果只读：不是 SELECT 查询",
+        QueryEditabilityReason::Cte => "查询结果只读：包含 CTE",
+        QueryEditabilityReason::SetOperation => {
+            "查询结果只读：包含 UNION/INTERSECT/EXCEPT 等集合操作"
+        }
+        QueryEditabilityReason::MultipleSources => "查询结果只读：包含 JOIN 或多个数据源",
+        QueryEditabilityReason::DerivedSource => "查询结果只读：数据源是子查询或表函数",
+        QueryEditabilityReason::Distinct => "查询结果只读：包含 DISTINCT",
+        QueryEditabilityReason::Aggregation => "查询结果只读：包含聚合或分组",
+        QueryEditabilityReason::UnsupportedSelect => "查询结果只读：包含不支持的 SELECT 子句",
+        QueryEditabilityReason::TableMismatch => "查询结果只读：元数据与数据源不匹配",
+        QueryEditabilityReason::View => "查询结果只读：数据源是视图",
+        QueryEditabilityReason::NoStableKey => {
+            "查询结果只读：数据源没有非空主键或唯一键"
+        }
+        QueryEditabilityReason::PrimaryKeyNotReturned => {
+            "查询结果只读：结果未返回完整的稳定键"
+        }
+    }
 }
 
 fn object_kind_icon(kind: &DatabaseObjectKind) -> &'static str {
@@ -1896,13 +3058,16 @@ mod tests {
         diagnostics::ExplainMode,
         driver::QueryEvent,
         metadata::{DatabaseObject, DatabaseObjectKind, ObjectPath},
+        table_data::TableRef,
     };
-    use dbc_data::{DataBatch, DataSchema};
+    use dbc_data::{CellValue, DataBatch, DataSchema};
     use eframe::egui::accesskit::Role;
     use egui_kittest::{
         Harness,
         kittest::{NodeT as _, Queryable as _},
     };
+
+    use crate::table_editor::EditorOrigin;
 
     #[test]
     fn write_confirmation_covers_all_query_languages() {
@@ -2263,6 +3428,87 @@ mod tests {
             "lazy child discovery",
         );
 
+        harness
+            .state_mut()
+            .open_table(TableRef::new(Vec::<String>::new(), "items"), &ctx);
+        wait_for_app(
+            &mut harness,
+            |app| {
+                !app.operation_busy
+                    && app
+                        .table_editor
+                        .as_ref()
+                        .is_some_and(|editor| editor.origin() == EditorOrigin::Table)
+            },
+            "table data load",
+        );
+        {
+            let editor = harness
+                .state_mut()
+                .table_editor
+                .as_mut()
+                .expect("table editor should be available");
+            assert_eq!(editor.total_rows(), 2);
+            assert!(editor.set_cell(
+                0,
+                1,
+                CellValue::Text("alpha-edited".to_owned())
+            ));
+        }
+        harness.state_mut().query_text = "SELECT 1".to_owned();
+        harness.state_mut().execute(&ctx);
+        assert!(!harness.state().operation_busy);
+        assert!(harness.state().status.contains("未保存变更"));
+
+        harness.state_mut().preview_table_changes(&ctx);
+        wait_for_app(
+            &mut harness,
+            |app| !app.operation_busy && app.prepared_table_change.is_some(),
+            "parameterized SQL preview",
+        );
+        let prepared = harness
+            .state()
+            .prepared_table_change
+            .as_ref()
+            .expect("change preview should be retained");
+        assert_eq!(prepared.plan.statements.len(), 1);
+        assert!(prepared.plan.statements[0].sql.contains('?'));
+        assert!(!prepared.plan.statements[0].sql.contains("alpha-edited"));
+        assert_eq!(
+            prepared.plan.statements[0].parameters[0].value,
+            CellValue::Text("alpha-edited".to_owned())
+        );
+
+        harness.state_mut().apply_prepared_table_changes(&ctx);
+        wait_for_app(
+            &mut harness,
+            |app| {
+                !app.operation_busy
+                    && app
+                        .table_editor
+                        .as_ref()
+                        .is_some_and(|editor| {
+                            editor.origin() == EditorOrigin::Table
+                                && editor.pending_change_count() == 0
+                        })
+            },
+            "table change apply and reload",
+        );
+        execute_query(
+            &mut harness,
+            "SELECT id, name FROM items ORDER BY id",
+            false,
+        );
+        wait_for_app(
+            &mut harness,
+            |app| {
+                app.table_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.origin() == EditorOrigin::Query)
+            },
+            "single-table query editability",
+        );
+
         harness.state_mut().query_text = "SELECT id, name FROM items WHERE id = 1".to_owned();
         harness
             .state_mut()
@@ -2294,7 +3540,7 @@ mod tests {
         let export =
             std::fs::read_to_string(&export_path).expect("exported CSV should be readable");
         assert!(export.starts_with("id,name\n"));
-        assert!(export.contains("1,alpha\n"));
+        assert!(export.contains("1,alpha-edited\n"));
         assert!(export.contains("2,beta\n"));
 
         let full_export_path = directory.path().join("items.jsonl");
@@ -2311,7 +3557,7 @@ mod tests {
         assert_eq!(full_export.lines().count(), 3);
         assert!(full_export.contains(r#""type":"schema""#));
         assert!(
-            full_export.contains(r#""values":["1","alpha"]"#),
+            full_export.contains(r#""values":["1","alpha-edited"]"#),
             "unexpected full export: {full_export}"
         );
 

@@ -33,24 +33,71 @@ use dbc_core::{
         SqlDialect, StatementRisk, classify_sql, is_single_statement,
         is_single_statement_for,
     },
+    table_data::{
+        StatementParameter, TableApplyResult, TableBrowseRequest, TableChangePlan,
+        TableChangeRequest, TableColumn, TableKind, TableMetadata, TablePage, TableRef,
+        TableStatementKind, UniqueKey,
+    },
 };
-use dbc_data::{DataBatch, DataSchema};
+use dbc_data::{CellValue, DataBatch, DataSchema};
 use futures_util::TryStreamExt;
 use sqlx::{
     AssertSqlSafe, Column, Decode, Either, Error as SqlxError, Executor, MySql, Row,
     SqlSafeStr, Statement, Type, TypeInfo, ValueRef,
     mysql::{
-        MySqlColumn, MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlRow,
+        MySqlArguments, MySqlColumn, MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlRow,
         types::MySqlTime,
     },
+    query::Query,
 };
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::mysql_descriptor;
+use crate::{
+    mysql_descriptor,
+    relational::{
+        RelationDialect, build_browse_plan, build_change_plan, is_binary_type,
+        validate_change_plan,
+    },
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const QUERY_BATCH_ROWS: usize = 4_096;
+const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+
+const TABLE_KIND_SQL: &str = r#"
+SELECT TABLE_TYPE AS relation_kind
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+LIMIT 1
+"#;
+
+const TABLE_COLUMNS_SQL: &str = r#"
+SELECT
+    COLUMN_NAME AS column_name,
+    COLUMN_TYPE AS database_type,
+    IS_NULLABLE = 'YES' AS nullable,
+    ORDINAL_POSITION AS ordinal,
+    COLUMN_DEFAULT AS default_expression,
+    EXTRA LIKE '%GENERATED%' AS generated,
+    EXTRA LIKE '%auto_increment%' AS auto_increment
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+ORDER BY ORDINAL_POSITION
+"#;
+
+const TABLE_UNIQUE_KEY_COLUMNS_SQL: &str = r#"
+SELECT
+    INDEX_NAME AS key_name,
+    INDEX_NAME = 'PRIMARY' AS primary_key,
+    COLUMN_NAME AS column_name,
+    SUB_PART AS prefix_length
+FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = ?
+  AND TABLE_NAME = ?
+  AND NON_UNIQUE = 0
+ORDER BY INDEX_NAME = 'PRIMARY' DESC, INDEX_NAME, SEQ_IN_INDEX
+"#;
 
 const LIST_SCHEMAS_SQL: &str = r#"
 SELECT
@@ -510,6 +557,190 @@ impl DatabaseSession for MySqlSession {
         })
     }
 
+    async fn table_metadata(
+        &self,
+        table: TableRef,
+        cancellation: CancellationToken,
+    ) -> Result<TableMetadata, DriverError> {
+        if table.qualifiers.len() > 1 {
+            return Err(DriverError::Unsupported(
+                "MySQL table references may contain one database qualifier".to_owned(),
+            ));
+        }
+        let deadline = operation_deadline(METADATA_TIMEOUT)?;
+        let database = if let Some(database) = table.qualifiers.first() {
+            database.clone()
+        } else {
+            controlled(
+                deadline,
+                &cancellation,
+                sqlx::query_scalar::<_, Option<String>>("SELECT DATABASE()")
+                    .fetch_one(&self.pool),
+            )
+            .await?
+            .map_err(map_query_error)?
+            .ok_or_else(|| {
+                DriverError::Connection(
+                    "MySQL connection has no current database".to_owned(),
+                )
+            })?
+        };
+        let relation_kind = controlled(
+            deadline,
+            &cancellation,
+            sqlx::query(TABLE_KIND_SQL)
+                .bind(&database)
+                .bind(&table.name)
+                .fetch_optional(&self.pool),
+        )
+        .await?
+        .map_err(map_query_error)?
+        .ok_or_else(|| DriverError::Unsupported("MySQL relation does not exist".to_owned()))?
+        .try_get::<String, _>("relation_kind")
+        .map_err(map_query_error)?;
+        let kind = if relation_kind.eq_ignore_ascii_case("VIEW") {
+            TableKind::View
+        } else {
+            TableKind::Table
+        };
+        let column_rows = controlled(
+            deadline,
+            &cancellation,
+            sqlx::query(TABLE_COLUMNS_SQL)
+                .bind(&database)
+                .bind(&table.name)
+                .fetch_all(&self.pool),
+        )
+        .await?
+        .map_err(map_query_error)?;
+        let columns = column_rows
+            .iter()
+            .map(mysql_table_column)
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns.is_empty() {
+            return Err(DriverError::Unsupported(
+                "MySQL relation has no visible columns".to_owned(),
+            ));
+        }
+        let unique_keys = if kind == TableKind::Table {
+            let rows = controlled(
+                deadline,
+                &cancellation,
+                sqlx::query(TABLE_UNIQUE_KEY_COLUMNS_SQL)
+                    .bind(&database)
+                    .bind(&table.name)
+                    .fetch_all(&self.pool),
+            )
+            .await?
+            .map_err(map_query_error)?;
+            mysql_unique_keys(&rows)?
+        } else {
+            Vec::new()
+        };
+
+        Ok(TableMetadata {
+            table,
+            kind,
+            columns,
+            unique_keys,
+        })
+    }
+
+    async fn browse_table(
+        &self,
+        request: TableBrowseRequest,
+        cancellation: CancellationToken,
+    ) -> Result<TablePage, DriverError> {
+        let metadata = self
+            .table_metadata(request.table.clone(), cancellation.clone())
+            .await?;
+        let browse = build_browse_plan(&metadata, &request, RelationDialect::MySql)?;
+        let deadline = operation_deadline(request.timeout)?;
+        let count = controlled(
+            deadline,
+            &cancellation,
+            bind_mysql_query(&browse.count_sql, &browse.parameters)?
+                .fetch_one(&self.pool),
+        )
+        .await?
+        .map_err(map_query_error)?
+        .try_get::<u64, _>(0)
+        .map_err(map_query_error)?;
+        let rows = controlled(
+            deadline,
+            &cancellation,
+            bind_mysql_query(&browse.page_sql, &browse.parameters)?
+                .fetch_all(&self.pool),
+        )
+        .await?
+        .map_err(map_query_error)?;
+        let values = rows
+            .iter()
+            .map(|row| {
+                (0..metadata.columns.len())
+                    .map(|index| decode_table_cell(row, index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(TablePage {
+            request_id: request.id,
+            table: request.table,
+            columns: metadata.columns,
+            rows: values,
+            total_rows: count,
+            page_index: request.page_index,
+            page_size: request.page_size,
+        })
+    }
+
+    async fn plan_table_changes(
+        &self,
+        request: TableChangeRequest,
+        cancellation: CancellationToken,
+    ) -> Result<TableChangePlan, DriverError> {
+        let metadata = self
+            .table_metadata(request.table.clone(), cancellation)
+            .await?;
+        build_change_plan(&metadata, request, RelationDialect::MySql)
+    }
+
+    async fn apply_table_changes(
+        &self,
+        plan: TableChangePlan,
+        cancellation: CancellationToken,
+    ) -> Result<TableApplyResult, DriverError> {
+        validate_change_plan(&plan, RelationDialect::MySql)?;
+        let deadline = operation_deadline(plan.timeout)?;
+        let request_id = plan.request_id;
+        let summary = plan.summary;
+        controlled(deadline, &cancellation, async {
+            let mut transaction = self.pool.begin().await.map_err(map_query_error)?;
+            for statement in &plan.statements {
+                let result = bind_mysql_query(&statement.sql, &statement.parameters)?
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(map_query_error)?;
+                if matches!(
+                    statement.kind,
+                    TableStatementKind::Update | TableStatementKind::Delete
+                ) && result.rows_affected() != 1
+                {
+                    transaction.rollback().await.map_err(map_query_error)?;
+                    return Err(DriverError::Conflict(
+                        "an edited row was changed or removed by another transaction".to_owned(),
+                    ));
+                }
+            }
+            transaction.commit().await.map_err(map_query_error)
+        })
+        .await??;
+        Ok(TableApplyResult {
+            request_id,
+            summary,
+        })
+    }
+
     async fn close(&self) -> Result<(), DriverError> {
         self.pool.close().await;
         Ok(())
@@ -719,6 +950,99 @@ where
     })
 }
 
+fn mysql_table_column(row: &MySqlRow) -> Result<TableColumn, DriverError> {
+    let ordinal = row
+        .try_get::<u64, _>("ordinal")
+        .map_err(map_query_error)?;
+    Ok(TableColumn {
+        name: row
+            .try_get::<String, _>("column_name")
+            .map_err(map_query_error)?,
+        database_type: row
+            .try_get::<String, _>("database_type")
+            .map_err(map_query_error)?,
+        nullable: row
+            .try_get::<bool, _>("nullable")
+            .map_err(map_query_error)?,
+        ordinal: u32::try_from(ordinal).map_err(|_| {
+            DriverError::Internal("MySQL returned an invalid column ordinal".to_owned())
+        })?,
+        default_expression: row
+            .try_get::<Option<String>, _>("default_expression")
+            .map_err(map_query_error)?,
+        generated: row
+            .try_get::<bool, _>("generated")
+            .map_err(map_query_error)?,
+        auto_increment: row
+            .try_get::<bool, _>("auto_increment")
+            .map_err(map_query_error)?,
+    })
+}
+
+fn mysql_unique_keys(rows: &[MySqlRow]) -> Result<Vec<UniqueKey>, DriverError> {
+    let mut keys: BTreeMap<String, (bool, Vec<String>, bool)> = BTreeMap::new();
+    for row in rows {
+        let name = row
+            .try_get::<String, _>("key_name")
+            .map_err(map_query_error)?;
+        let primary = row
+            .try_get::<bool, _>("primary_key")
+            .map_err(map_query_error)?;
+        let column = row
+            .try_get::<Option<String>, _>("column_name")
+            .map_err(map_query_error)?;
+        let prefix = row
+            .try_get::<Option<u64>, _>("prefix_length")
+            .map_err(map_query_error)?;
+        let key = keys
+            .entry(name)
+            .or_insert_with(|| (primary, Vec::new(), true));
+        if let Some(column) = column {
+            key.1.push(column);
+        } else {
+            key.2 = false;
+        }
+        if prefix.is_some() {
+            key.2 = false;
+        }
+    }
+    Ok(keys
+        .into_iter()
+        .filter_map(|(name, (primary, columns, usable))| {
+            (usable && !columns.is_empty()).then_some(UniqueKey {
+                name,
+                columns,
+                primary,
+            })
+        })
+        .collect())
+}
+
+fn bind_mysql_query<'a>(
+    sql: &'a str,
+    parameters: &'a [StatementParameter],
+) -> Result<Query<'a, MySql, MySqlArguments>, DriverError> {
+    let mut query = sqlx::query(AssertSqlSafe(sql).into_sql_str());
+    for parameter in parameters {
+        query = match &parameter.value {
+            CellValue::Null
+                if is_binary_type(&parameter.database_type, RelationDialect::MySql) =>
+            {
+                query.bind(Option::<&[u8]>::None)
+            }
+            CellValue::Null => query.bind(Option::<&str>::None),
+            CellValue::Text(value) => query.bind(value.as_str()),
+            CellValue::Binary(value) => query.bind(value.as_slice()),
+            CellValue::Default => {
+                return Err(DriverError::Query(
+                    "DEFAULT cannot be bound as a MySQL parameter".to_owned(),
+                ));
+            }
+        };
+    }
+    Ok(query)
+}
+
 struct TextBatchBuilder {
     schema: SchemaRef,
     columns: Vec<Vec<Option<String>>>,
@@ -817,6 +1141,31 @@ fn decode_cell(row: &MySqlRow, index: usize) -> Result<Option<String>, DriverErr
         ))
     })?;
     Ok(Some(decoded))
+}
+
+fn decode_table_cell(row: &MySqlRow, index: usize) -> Result<CellValue, DriverError> {
+    let raw = row.try_get_raw(index).map_err(|_| {
+        DriverError::Internal(format!("could not access MySQL column {index}"))
+    })?;
+    if raw.is_null() {
+        return Ok(CellValue::Null);
+    }
+    if is_binary_type(
+        row.column(index).type_info().name(),
+        RelationDialect::MySql,
+    ) {
+        return row
+            .try_get::<Vec<u8>, _>(index)
+            .map(CellValue::Binary)
+            .map_err(|_| {
+                DriverError::Internal(format!(
+                    "could not decode MySQL binary column {index}"
+                ))
+            });
+    }
+    decode_cell(row, index)?
+        .map(CellValue::Text)
+        .ok_or_else(|| DriverError::Internal("non-null MySQL cell decoded as NULL".to_owned()))
 }
 
 fn display_value<T>(row: &MySqlRow, index: usize) -> Result<String, SqlxError>

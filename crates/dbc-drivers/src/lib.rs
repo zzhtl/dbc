@@ -4,6 +4,7 @@ mod mongo;
 mod mysql;
 mod postgres;
 mod redis;
+mod relational;
 mod sqlite;
 
 use std::sync::Arc;
@@ -55,6 +56,7 @@ fn postgres_descriptor() -> DriverDescriptor {
         transactional_crud(),
         Some(full_explain()),
         Some(configurable_slow_queries()),
+        true,
     )
 }
 
@@ -66,6 +68,7 @@ fn mysql_descriptor() -> DriverDescriptor {
         transactional_crud(),
         Some(full_explain()),
         Some(configurable_slow_queries()),
+        true,
     )
 }
 
@@ -80,6 +83,7 @@ fn mongo_descriptor() -> DriverDescriptor {
             available: true,
             configurable: true,
         }),
+        false,
     )
 }
 
@@ -94,6 +98,7 @@ fn sqlite_descriptor() -> DriverDescriptor {
             analyzed: false,
         }),
         None,
+        true,
     )
 }
 
@@ -113,6 +118,7 @@ fn redis_descriptor() -> DriverDescriptor {
             available: true,
             configurable: false,
         }),
+        false,
     )
 }
 
@@ -123,6 +129,7 @@ fn descriptor(
     crud: CrudCapabilities,
     explain: Option<ExplainCapabilities>,
     slow_queries: Option<SlowQueryCapabilities>,
+    table_data: bool,
 ) -> DriverDescriptor {
     let mut capabilities = CapabilitySet::builder()
         .query_language(language)
@@ -136,6 +143,9 @@ fn descriptor(
     }
     if let Some(slow_queries) = slow_queries {
         capabilities = capabilities.enable(Capability::SlowQueries(slow_queries));
+    }
+    if table_data {
+        capabilities = capabilities.enable(Capability::TableData);
     }
 
     DriverDescriptor {

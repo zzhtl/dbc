@@ -4,6 +4,20 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use serde::{Deserialize, Serialize};
 
+/// A database cell used by editable table data.
+///
+/// Text values intentionally retain their database representation so drivers
+/// can bind them with the destination column type. Binary and `NULL` values
+/// remain distinct, while `Default` is only valid for inserted values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum CellValue {
+    Null,
+    Text(String),
+    Binary(Vec<u8>),
+    Default,
+}
+
 /// Schema metadata emitted before the first row of a result set.
 #[derive(Debug, Clone)]
 pub enum DataSchema {

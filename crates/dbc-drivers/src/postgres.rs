@@ -33,25 +33,105 @@ use dbc_core::{
         SqlDialect, StatementRisk, classify_sql, is_single_statement,
         is_single_statement_for,
     },
+    table_data::{
+        StatementParameter, TableApplyResult, TableBrowseRequest, TableChangePlan,
+        TableChangeRequest, TableColumn, TableKind, TableMetadata, TablePage, TableRef,
+        TableStatementKind, UniqueKey,
+    },
 };
-use dbc_data::{DataBatch, DataSchema};
+use dbc_data::{CellValue, DataBatch, DataSchema};
 use futures_util::TryStreamExt;
 use sqlx::{
     AssertSqlSafe, Column, Decode, Either, Error as SqlxError, Executor, Postgres, Row,
     SqlSafeStr, Statement, Type, TypeInfo, ValueRef,
     postgres::{
-        PgColumn, PgConnectOptions, PgPool, PgPoolOptions, PgRow, PgValueFormat,
+        PgArguments, PgColumn, PgConnectOptions, PgPool, PgPoolOptions, PgRow, PgValueFormat,
         types::{Oid, PgInterval},
     },
+    query::Query,
 };
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::postgres_descriptor;
+use crate::{
+    postgres_descriptor,
+    relational::{
+        RelationDialect, build_browse_plan, build_change_plan, is_binary_type,
+        validate_change_plan,
+    },
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const QUERY_BATCH_ROWS: usize = 4_096;
+const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+
+const TABLE_KIND_SQL: &str = r#"
+SELECT c.relkind::text AS relation_kind
+FROM pg_catalog.pg_class AS c
+INNER JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+WHERE n.nspname = $1
+  AND c.relname = $2
+  AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+LIMIT 1
+"#;
+
+const TABLE_COLUMNS_SQL: &str = r#"
+SELECT
+    a.attname AS column_name,
+    pg_catalog.format_type(a.atttypid, a.atttypmod) AS database_type,
+    NOT a.attnotnull AS nullable,
+    a.attnum::integer AS ordinal,
+    pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS default_expression,
+    a.attgenerated <> '' AS generated,
+    (
+        a.attidentity <> ''
+        OR COALESCE(
+            pg_catalog.pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval(%',
+            false
+        )
+    ) AS auto_increment
+FROM pg_catalog.pg_attribute AS a
+INNER JOIN pg_catalog.pg_class AS c ON c.oid = a.attrelid
+INNER JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+LEFT JOIN pg_catalog.pg_attrdef AS d
+    ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+WHERE n.nspname = $1
+  AND c.relname = $2
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+ORDER BY a.attnum
+"#;
+
+const TABLE_UNIQUE_KEYS_SQL: &str = r#"
+SELECT
+    index_class.relname AS key_name,
+    index_info.indisprimary AS primary_key,
+    array_agg(attribute.attname ORDER BY key_column.ordinality) AS columns
+FROM pg_catalog.pg_index AS index_info
+INNER JOIN pg_catalog.pg_class AS relation
+    ON relation.oid = index_info.indrelid
+INNER JOIN pg_catalog.pg_namespace AS namespace
+    ON namespace.oid = relation.relnamespace
+INNER JOIN pg_catalog.pg_class AS index_class
+    ON index_class.oid = index_info.indexrelid
+INNER JOIN unnest(index_info.indkey::smallint[])
+    WITH ORDINALITY AS key_column(attnum, ordinality)
+    ON true
+INNER JOIN pg_catalog.pg_attribute AS attribute
+    ON attribute.attrelid = relation.oid
+    AND attribute.attnum = key_column.attnum
+WHERE namespace.nspname = $1
+  AND relation.relname = $2
+  AND index_info.indisunique
+  AND index_info.indisvalid
+  AND index_info.indisready
+  AND index_info.indpred IS NULL
+  AND index_info.indexprs IS NULL
+  AND key_column.ordinality <= index_info.indnkeyatts
+GROUP BY index_class.relname, index_info.indisprimary
+ORDER BY index_info.indisprimary DESC, index_class.relname
+"#;
 
 const LIST_SCHEMAS_SQL: &str = r#"
 SELECT
@@ -542,6 +622,195 @@ impl DatabaseSession for PostgresSession {
         })
     }
 
+    async fn table_metadata(
+        &self,
+        table: TableRef,
+        cancellation: CancellationToken,
+    ) -> Result<TableMetadata, DriverError> {
+        if table.qualifiers.len() > 1 {
+            return Err(DriverError::Unsupported(
+                "PostgreSQL table references may contain one schema qualifier".to_owned(),
+            ));
+        }
+        let deadline = operation_deadline(METADATA_TIMEOUT)?;
+        let schema = if let Some(schema) = table.qualifiers.first() {
+            schema.clone()
+        } else {
+            controlled(
+                deadline,
+                &cancellation,
+                sqlx::query_scalar::<_, String>("SELECT current_schema()")
+                    .fetch_one(&self.pool),
+            )
+            .await?
+            .map_err(map_query_error)?
+        };
+        let relation_kind = controlled(
+            deadline,
+            &cancellation,
+            sqlx::query(TABLE_KIND_SQL)
+                .bind(&schema)
+                .bind(&table.name)
+                .fetch_optional(&self.pool),
+        )
+        .await?
+        .map_err(map_query_error)?
+        .ok_or_else(|| DriverError::Unsupported("PostgreSQL relation does not exist".to_owned()))?
+        .try_get::<String, _>("relation_kind")
+        .map_err(map_query_error)?;
+        let kind = match relation_kind.as_str() {
+            "r" | "p" | "f" => TableKind::Table,
+            "v" | "m" => TableKind::View,
+            _ => {
+                return Err(DriverError::Unsupported(
+                    "PostgreSQL object is not a table or view".to_owned(),
+                ));
+            }
+        };
+        let column_rows = controlled(
+            deadline,
+            &cancellation,
+            sqlx::query(TABLE_COLUMNS_SQL)
+                .bind(&schema)
+                .bind(&table.name)
+                .fetch_all(&self.pool),
+        )
+        .await?
+        .map_err(map_query_error)?;
+        let columns = column_rows
+            .iter()
+            .map(postgres_table_column)
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns.is_empty() {
+            return Err(DriverError::Unsupported(
+                "PostgreSQL relation has no visible columns".to_owned(),
+            ));
+        }
+        let unique_keys = if kind == TableKind::Table {
+            controlled(
+                deadline,
+                &cancellation,
+                sqlx::query(TABLE_UNIQUE_KEYS_SQL)
+                    .bind(&schema)
+                    .bind(&table.name)
+                    .fetch_all(&self.pool),
+            )
+            .await?
+            .map_err(map_query_error)?
+            .iter()
+            .map(postgres_unique_key)
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+
+        Ok(TableMetadata {
+            table,
+            kind,
+            columns,
+            unique_keys,
+        })
+    }
+
+    async fn browse_table(
+        &self,
+        request: TableBrowseRequest,
+        cancellation: CancellationToken,
+    ) -> Result<TablePage, DriverError> {
+        let metadata = self
+            .table_metadata(request.table.clone(), cancellation.clone())
+            .await?;
+        let browse = build_browse_plan(&metadata, &request, RelationDialect::PostgreSql)?;
+        let deadline = operation_deadline(request.timeout)?;
+        let count = controlled(
+            deadline,
+            &cancellation,
+            bind_postgres_query(&browse.count_sql, &browse.parameters)?
+                .fetch_one(&self.pool),
+        )
+        .await?
+        .map_err(map_query_error)?
+        .try_get::<i64, _>(0)
+        .map_err(map_query_error)?;
+        let rows = controlled(
+            deadline,
+            &cancellation,
+            bind_postgres_query(&browse.page_sql, &browse.parameters)?
+                .fetch_all(&self.pool),
+        )
+        .await?
+        .map_err(map_query_error)?;
+        let values = rows
+            .iter()
+            .map(|row| {
+                (0..metadata.columns.len())
+                    .map(|index| decode_table_cell(row, index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(TablePage {
+            request_id: request.id,
+            table: request.table,
+            columns: metadata.columns,
+            rows: values,
+            total_rows: u64::try_from(count).map_err(|_| {
+                DriverError::Internal(
+                    "PostgreSQL returned a negative table row count".to_owned(),
+                )
+            })?,
+            page_index: request.page_index,
+            page_size: request.page_size,
+        })
+    }
+
+    async fn plan_table_changes(
+        &self,
+        request: TableChangeRequest,
+        cancellation: CancellationToken,
+    ) -> Result<TableChangePlan, DriverError> {
+        let metadata = self
+            .table_metadata(request.table.clone(), cancellation)
+            .await?;
+        build_change_plan(&metadata, request, RelationDialect::PostgreSql)
+    }
+
+    async fn apply_table_changes(
+        &self,
+        plan: TableChangePlan,
+        cancellation: CancellationToken,
+    ) -> Result<TableApplyResult, DriverError> {
+        validate_change_plan(&plan, RelationDialect::PostgreSql)?;
+        let deadline = operation_deadline(plan.timeout)?;
+        let request_id = plan.request_id;
+        let summary = plan.summary;
+        controlled(deadline, &cancellation, async {
+            let mut transaction = self.pool.begin().await.map_err(map_query_error)?;
+            for statement in &plan.statements {
+                let result = bind_postgres_query(&statement.sql, &statement.parameters)?
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(map_query_error)?;
+                if matches!(
+                    statement.kind,
+                    TableStatementKind::Update | TableStatementKind::Delete
+                ) && result.rows_affected() != 1
+                {
+                    transaction.rollback().await.map_err(map_query_error)?;
+                    return Err(DriverError::Conflict(
+                        "an edited row was changed or removed by another transaction".to_owned(),
+                    ));
+                }
+            }
+            transaction.commit().await.map_err(map_query_error)
+        })
+        .await??;
+        Ok(TableApplyResult {
+            request_id,
+            summary,
+        })
+    }
+
     async fn close(&self) -> Result<(), DriverError> {
         self.pool.close().await;
         Ok(())
@@ -801,6 +1070,74 @@ fn nonnegative_i64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or_default()
 }
 
+fn postgres_table_column(row: &PgRow) -> Result<TableColumn, DriverError> {
+    let ordinal = row
+        .try_get::<i32, _>("ordinal")
+        .map_err(map_query_error)?;
+    Ok(TableColumn {
+        name: row
+            .try_get::<String, _>("column_name")
+            .map_err(map_query_error)?,
+        database_type: row
+            .try_get::<String, _>("database_type")
+            .map_err(map_query_error)?,
+        nullable: row
+            .try_get::<bool, _>("nullable")
+            .map_err(map_query_error)?,
+        ordinal: u32::try_from(ordinal).map_err(|_| {
+            DriverError::Internal("PostgreSQL returned an invalid column ordinal".to_owned())
+        })?,
+        default_expression: row
+            .try_get::<Option<String>, _>("default_expression")
+            .map_err(map_query_error)?,
+        generated: row
+            .try_get::<bool, _>("generated")
+            .map_err(map_query_error)?,
+        auto_increment: row
+            .try_get::<bool, _>("auto_increment")
+            .map_err(map_query_error)?,
+    })
+}
+
+fn postgres_unique_key(row: &PgRow) -> Result<UniqueKey, DriverError> {
+    Ok(UniqueKey {
+        name: row
+            .try_get::<String, _>("key_name")
+            .map_err(map_query_error)?,
+        columns: row
+            .try_get::<Vec<String>, _>("columns")
+            .map_err(map_query_error)?,
+        primary: row
+            .try_get::<bool, _>("primary_key")
+            .map_err(map_query_error)?,
+    })
+}
+
+fn bind_postgres_query<'a>(
+    sql: &'a str,
+    parameters: &'a [StatementParameter],
+) -> Result<Query<'a, Postgres, PgArguments>, DriverError> {
+    let mut query = sqlx::query(AssertSqlSafe(sql).into_sql_str());
+    for parameter in parameters {
+        query = match &parameter.value {
+            CellValue::Null
+                if is_binary_type(&parameter.database_type, RelationDialect::PostgreSql) =>
+            {
+                query.bind(Option::<&[u8]>::None)
+            }
+            CellValue::Null => query.bind(Option::<&str>::None),
+            CellValue::Text(value) => query.bind(value.as_str()),
+            CellValue::Binary(value) => query.bind(value.as_slice()),
+            CellValue::Default => {
+                return Err(DriverError::Query(
+                    "DEFAULT cannot be bound as a PostgreSQL parameter".to_owned(),
+                ));
+            }
+        };
+    }
+    Ok(query)
+}
+
 struct TextBatchBuilder {
     schema: SchemaRef,
     columns: Vec<Vec<Option<String>>>,
@@ -911,6 +1248,28 @@ fn decode_cell(row: &PgRow, index: usize) -> Result<Option<String>, DriverError>
     })?;
 
     Ok(Some(decoded))
+}
+
+fn decode_table_cell(row: &PgRow, index: usize) -> Result<CellValue, DriverError> {
+    let raw = row.try_get_raw(index).map_err(|_| {
+        DriverError::Internal(format!("could not access PostgreSQL column {index}"))
+    })?;
+    if raw.is_null() {
+        return Ok(CellValue::Null);
+    }
+    if row.column(index).type_info().name() == "BYTEA" {
+        return row
+            .try_get::<Vec<u8>, _>(index)
+            .map(CellValue::Binary)
+            .map_err(|_| {
+                DriverError::Internal(format!(
+                    "could not decode PostgreSQL binary column {index}"
+                ))
+            });
+    }
+    decode_cell(row, index)?
+        .map(CellValue::Text)
+        .ok_or_else(|| DriverError::Internal("non-null PostgreSQL cell decoded as NULL".to_owned()))
 }
 
 fn display_value<T>(row: &PgRow, index: usize) -> Result<String, SqlxError>

@@ -49,6 +49,7 @@ fn relational_and_specialized_capabilities_are_not_flattened() {
     assert!(postgres.capabilities.supports_crud());
     assert!(postgres.capabilities.supports_explain());
     assert!(postgres.capabilities.supports_slow_queries());
+    assert!(postgres.capabilities.supports_table_data());
     assert!(
         postgres
             .capabilities
@@ -59,6 +60,7 @@ fn relational_and_specialized_capabilities_are_not_flattened() {
     assert!(mongo.capabilities.supports_crud());
     assert!(mongo.capabilities.supports_explain());
     assert!(mongo.capabilities.supports_slow_queries());
+    assert!(!mongo.capabilities.supports_table_data());
     assert!(
         mongo
             .capabilities
@@ -68,6 +70,7 @@ fn relational_and_specialized_capabilities_are_not_flattened() {
     assert!(redis.capabilities.supports_crud());
     assert!(!redis.capabilities.supports_explain());
     assert!(redis.capabilities.supports_slow_queries());
+    assert!(!redis.capabilities.supports_table_data());
     assert!(
         redis
             .capabilities
@@ -77,6 +80,7 @@ fn relational_and_specialized_capabilities_are_not_flattened() {
 
     assert!(sqlite.capabilities.supports_explain());
     assert!(!sqlite.capabilities.supports_slow_queries());
+    assert!(sqlite.capabilities.supports_table_data());
     assert!(postgres.capabilities.capabilities().iter().any(
         |capability| matches!(capability, Capability::SlowQueries(settings) if settings.configurable)
     ));

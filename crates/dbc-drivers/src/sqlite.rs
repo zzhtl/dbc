@@ -29,21 +29,64 @@ use dbc_core::{
         SqlDialect, StatementRisk, classify_sql, is_single_statement,
         is_single_statement_for,
     },
+    table_data::{
+        StatementParameter, TableApplyResult, TableBrowseRequest, TableChangePlan,
+        TableChangeRequest, TableColumn, TableKind, TableMetadata, TablePage, TableRef,
+        TableStatementKind, UniqueKey,
+    },
 };
-use dbc_data::{DataBatch, DataSchema};
+use dbc_data::{CellValue, DataBatch, DataSchema};
 use futures_util::TryStreamExt;
 use sqlx::{
     AssertSqlSafe, Column, Decode, Either, Error as SqlxError, Executor, Row, Sqlite,
     SqlSafeStr, Statement, Type, TypeInfo, ValueRef,
-    sqlite::{SqliteColumn, SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow},
+    query::Query,
+    sqlite::{
+        SqliteArguments, SqliteColumn, SqliteConnectOptions, SqlitePool, SqlitePoolOptions,
+        SqliteRow,
+    },
 };
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::sqlite_descriptor;
+use crate::{
+    relational::{
+        RelationDialect, build_browse_plan, build_change_plan, is_binary_type,
+        validate_change_plan,
+    },
+    sqlite_descriptor,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const QUERY_BATCH_ROWS: usize = 4_096;
+const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+
+const TABLE_KIND_SQL: &str = r#"
+SELECT type
+FROM sqlite_schema
+WHERE name = ? AND type IN ('table', 'view')
+LIMIT 1
+"#;
+
+const TABLE_COLUMNS_SQL: &str = r#"
+SELECT cid, name, type, "notnull", dflt_value, pk, hidden
+FROM pragma_table_xinfo(?)
+WHERE hidden <> 1
+ORDER BY cid
+"#;
+
+const TABLE_UNIQUE_INDEXES_SQL: &str = r#"
+SELECT name
+FROM pragma_index_list(?)
+WHERE "unique" = 1 AND partial = 0 AND origin <> 'pk'
+ORDER BY name
+"#;
+
+const TABLE_INDEX_COLUMNS_SQL: &str = r#"
+SELECT name
+FROM pragma_index_info(?)
+ORDER BY seqno
+"#;
 
 const LIST_ROOT_OBJECTS_SQL: &str = r#"
 SELECT
@@ -372,6 +415,219 @@ impl DatabaseSession for SqliteSession {
         })
     }
 
+    async fn table_metadata(
+        &self,
+        table: TableRef,
+        cancellation: CancellationToken,
+    ) -> Result<TableMetadata, DriverError> {
+        if !table.qualifiers.is_empty()
+            && table.qualifiers.as_slice() != ["main"]
+        {
+            return Err(DriverError::Unsupported(
+                "SQLite table editing currently supports the main database only".to_owned(),
+            ));
+        }
+        let deadline = operation_deadline(METADATA_TIMEOUT)?;
+        let relation = controlled(
+            deadline,
+            &cancellation,
+            sqlx::query(TABLE_KIND_SQL)
+                .bind(&table.name)
+                .fetch_optional(&self.pool),
+        )
+        .await?
+        .map_err(map_query_error)?
+        .ok_or_else(|| DriverError::Unsupported("SQLite relation does not exist".to_owned()))?;
+        let kind = match relation.try_get::<String, _>("type").map_err(map_query_error)? {
+            value if value == "table" => TableKind::Table,
+            value if value == "view" => TableKind::View,
+            _ => {
+                return Err(DriverError::Unsupported(
+                    "SQLite object is not a table or view".to_owned(),
+                ));
+            }
+        };
+        let column_rows = controlled(
+            deadline,
+            &cancellation,
+            sqlx::query(TABLE_COLUMNS_SQL)
+                .bind(&table.name)
+                .fetch_all(&self.pool),
+        )
+        .await?
+        .map_err(map_query_error)?;
+        let mut primary_columns = Vec::new();
+        let mut columns = column_rows
+            .iter()
+            .map(|row| sqlite_table_column(row, &mut primary_columns))
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns.is_empty() {
+            return Err(DriverError::Unsupported(
+                "SQLite relation has no visible columns".to_owned(),
+            ));
+        }
+        primary_columns.sort_by_key(|(position, _)| *position);
+        let mut unique_keys = Vec::new();
+        if !primary_columns.is_empty() {
+            unique_keys.push(UniqueKey {
+                name: "sqlite_primary_key".to_owned(),
+                columns: primary_columns
+                    .iter()
+                    .map(|(_, name)| name.clone())
+                    .collect(),
+                primary: true,
+            });
+        }
+        if primary_columns.len() == 1 {
+            let primary_name = &primary_columns[0].1;
+            if let Some(column) = columns.iter_mut().find(|column| &column.name == primary_name) {
+                column.auto_increment = column.database_type.eq_ignore_ascii_case("INTEGER");
+            }
+        }
+
+        if kind == TableKind::Table {
+            let index_rows = controlled(
+                deadline,
+                &cancellation,
+                sqlx::query(TABLE_UNIQUE_INDEXES_SQL)
+                    .bind(&table.name)
+                    .fetch_all(&self.pool),
+            )
+            .await?
+            .map_err(map_query_error)?;
+            for row in index_rows {
+                let name = row.try_get::<String, _>("name").map_err(map_query_error)?;
+                let index_columns = controlled(
+                    deadline,
+                    &cancellation,
+                    sqlx::query(TABLE_INDEX_COLUMNS_SQL)
+                        .bind(&name)
+                        .fetch_all(&self.pool),
+                )
+                .await?
+                .map_err(map_query_error)?;
+                let names = index_columns
+                    .iter()
+                    .map(|row| {
+                        row.try_get::<Option<String>, _>("name")
+                            .map_err(map_query_error)
+                    })
+                    .collect::<Result<Option<Vec<_>>, _>>()?;
+                if let Some(names) = names.filter(|names| !names.is_empty()) {
+                    unique_keys.push(UniqueKey {
+                        name,
+                        columns: names,
+                        primary: false,
+                    });
+                }
+            }
+        }
+
+        Ok(TableMetadata {
+            table,
+            kind,
+            columns,
+            unique_keys,
+        })
+    }
+
+    async fn browse_table(
+        &self,
+        request: TableBrowseRequest,
+        cancellation: CancellationToken,
+    ) -> Result<TablePage, DriverError> {
+        let metadata = self
+            .table_metadata(request.table.clone(), cancellation.clone())
+            .await?;
+        let browse = build_browse_plan(&metadata, &request, RelationDialect::SQLite)?;
+        let deadline = operation_deadline(request.timeout)?;
+        let count = controlled(
+            deadline,
+            &cancellation,
+            bind_sqlite_query(&browse.count_sql, &browse.parameters)?
+                .fetch_one(&self.pool),
+        )
+        .await?
+        .map_err(map_query_error)?
+        .try_get::<i64, _>(0)
+        .map_err(map_query_error)?;
+        let rows = controlled(
+            deadline,
+            &cancellation,
+            bind_sqlite_query(&browse.page_sql, &browse.parameters)?
+                .fetch_all(&self.pool),
+        )
+        .await?
+        .map_err(map_query_error)?;
+        let values = rows
+            .iter()
+            .map(|row| {
+                (0..metadata.columns.len())
+                    .map(|index| decode_table_cell(row, index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(TablePage {
+            request_id: request.id,
+            table: request.table,
+            columns: metadata.columns,
+            rows: values,
+            total_rows: u64::try_from(count).map_err(|_| {
+                DriverError::Internal("SQLite returned a negative table row count".to_owned())
+            })?,
+            page_index: request.page_index,
+            page_size: request.page_size,
+        })
+    }
+
+    async fn plan_table_changes(
+        &self,
+        request: TableChangeRequest,
+        cancellation: CancellationToken,
+    ) -> Result<TableChangePlan, DriverError> {
+        let metadata = self
+            .table_metadata(request.table.clone(), cancellation)
+            .await?;
+        build_change_plan(&metadata, request, RelationDialect::SQLite)
+    }
+
+    async fn apply_table_changes(
+        &self,
+        plan: TableChangePlan,
+        cancellation: CancellationToken,
+    ) -> Result<TableApplyResult, DriverError> {
+        validate_change_plan(&plan, RelationDialect::SQLite)?;
+        let deadline = operation_deadline(plan.timeout)?;
+        let request_id = plan.request_id;
+        let summary = plan.summary;
+        controlled(deadline, &cancellation, async {
+            let mut transaction = self.pool.begin().await.map_err(map_query_error)?;
+            for statement in &plan.statements {
+                let result = bind_sqlite_query(&statement.sql, &statement.parameters)?
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(map_query_error)?;
+                if matches!(
+                    statement.kind,
+                    TableStatementKind::Update | TableStatementKind::Delete
+                ) && result.rows_affected() != 1
+                {
+                    transaction.rollback().await.map_err(map_query_error)?;
+                    return Err(DriverError::Conflict(
+                        "an edited row was changed or removed by another transaction".to_owned(),
+                    ));
+                }
+            }
+            transaction.commit().await.map_err(map_query_error)
+        })
+        .await??;
+        Ok(TableApplyResult {
+            request_id,
+            summary,
+        })
+    }
+
     async fn close(&self) -> Result<(), DriverError> {
         self.pool.close().await;
         Ok(())
@@ -494,6 +750,66 @@ fn object_kind(kind: &str) -> DatabaseObjectKind {
     }
 }
 
+fn sqlite_table_column(
+    row: &SqliteRow,
+    primary_columns: &mut Vec<(i64, String)>,
+) -> Result<TableColumn, DriverError> {
+    let cid = row.try_get::<i64, _>("cid").map_err(map_query_error)?;
+    let name = row.try_get::<String, _>("name").map_err(map_query_error)?;
+    let database_type = row.try_get::<String, _>("type").map_err(map_query_error)?;
+    let primary_position = row.try_get::<i64, _>("pk").map_err(map_query_error)?;
+    if primary_position > 0 {
+        primary_columns.push((primary_position, name.clone()));
+    }
+    let ordinal = cid
+        .checked_add(1)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| DriverError::Internal("SQLite returned an invalid column id".to_owned()))?;
+    Ok(TableColumn {
+        name,
+        database_type,
+        nullable: primary_position == 0
+            && row
+                .try_get::<i64, _>("notnull")
+                .map_err(map_query_error)?
+                == 0,
+        ordinal,
+        default_expression: row
+            .try_get::<Option<String>, _>("dflt_value")
+            .map_err(map_query_error)?,
+        generated: row
+            .try_get::<i64, _>("hidden")
+            .map_err(map_query_error)?
+            != 0,
+        auto_increment: false,
+    })
+}
+
+fn bind_sqlite_query<'a>(
+    sql: &'a str,
+    parameters: &'a [StatementParameter],
+) -> Result<Query<'a, Sqlite, SqliteArguments>, DriverError> {
+    let mut query = sqlx::query(AssertSqlSafe(sql).into_sql_str());
+    for parameter in parameters {
+        query = match &parameter.value {
+            CellValue::Null
+                if is_binary_type(&parameter.database_type, RelationDialect::SQLite) =>
+            {
+                query.bind(Option::<&[u8]>::None)
+            }
+            CellValue::Null => query.bind(Option::<&str>::None),
+            CellValue::Text(value) => query.bind(value.as_str()),
+            CellValue::Binary(value) => query.bind(value.as_slice()),
+            CellValue::Default => {
+                return Err(DriverError::Query(
+                    "DEFAULT cannot be bound as a SQLite parameter".to_owned(),
+                ));
+            }
+        };
+    }
+    Ok(query)
+}
+
 struct TextBatchBuilder {
     schema: SchemaRef,
     columns: Vec<Vec<Option<String>>>,
@@ -575,6 +891,28 @@ fn decode_cell(row: &SqliteRow, index: usize) -> Result<Option<String>, DriverEr
         ))
     })?;
     Ok(Some(decoded))
+}
+
+fn decode_table_cell(row: &SqliteRow, index: usize) -> Result<CellValue, DriverError> {
+    let raw = row.try_get_raw(index).map_err(|_| {
+        DriverError::Internal(format!("could not access SQLite column {index}"))
+    })?;
+    if raw.is_null() {
+        return Ok(CellValue::Null);
+    }
+    if row.column(index).type_info().name() == "BLOB" {
+        return row
+            .try_get::<Vec<u8>, _>(index)
+            .map(CellValue::Binary)
+            .map_err(|_| {
+                DriverError::Internal(format!(
+                    "could not decode SQLite binary column {index}"
+                ))
+            });
+    }
+    decode_cell(row, index)?
+        .map(CellValue::Text)
+        .ok_or_else(|| DriverError::Internal("non-null SQLite cell decoded as NULL".to_owned()))
 }
 
 fn display_value<T>(row: &SqliteRow, index: usize) -> Result<String, SqlxError>

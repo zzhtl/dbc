@@ -1,4 +1,4 @@
-use std::{env, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
 
 use arrow_array::StringArray;
 use dbc_core::{
@@ -10,8 +10,11 @@ use dbc_core::{
     error::DriverError,
     metadata::{DatabaseObjectKind, ObjectListRequest, ObjectPath},
     query::QueryRequest,
+    table_data::{
+        SortDirection, TableBrowseRequest, TableChangeRequest, TableRef, TableSort, TableUpdate,
+    },
 };
-use dbc_data::DataBatch;
+use dbc_data::{CellValue, DataBatch};
 use dbc_drivers::PostgresFactory;
 use futures_util::TryStreamExt;
 use tokio_util::sync::CancellationToken;
@@ -88,6 +91,78 @@ VALUES
         .expect("PostgreSQL text columns should use Arrow UTF-8");
     assert_eq!(names.value(0), "alpha");
     assert_eq!(names.value(1), "beta");
+
+    let table = TableRef::new(["public"], "dbc_contract_items");
+    let metadata = session
+        .table_metadata(table.clone(), CancellationToken::new())
+        .await?;
+    assert_eq!(
+        metadata
+            .stable_key()
+            .expect("PostgreSQL primary key should be stable")
+            .columns,
+        ["id"]
+    );
+    let page = session
+        .browse_table(
+            TableBrowseRequest {
+                id: Uuid::new_v4(),
+                table: table.clone(),
+                filters: Vec::new(),
+                sort: Some(vec![TableSort {
+                    column: "id".to_owned(),
+                    direction: SortDirection::Ascending,
+                }]),
+                raw_where: None,
+                raw_order_by: None,
+                page_index: 0,
+                page_size: 1,
+                timeout: Duration::from_secs(5),
+            },
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(page.total_rows, 2);
+    assert_eq!(page.rows.len(), 1);
+
+    let update_request = TableChangeRequest {
+        id: Uuid::new_v4(),
+        table: table.clone(),
+        inserts: Vec::new(),
+        updates: vec![TableUpdate {
+            identity: BTreeMap::from([(
+                "id".to_owned(),
+                CellValue::Text("1".to_owned()),
+            )]),
+            original_values: BTreeMap::from([(
+                "name".to_owned(),
+                CellValue::Text("alpha".to_owned()),
+            )]),
+            values: BTreeMap::from([(
+                "name".to_owned(),
+                CellValue::Text("alpha-edited".to_owned()),
+            )]),
+        }],
+        deletes: Vec::new(),
+        timeout: Duration::from_secs(5),
+    };
+    let update_plan = session
+        .plan_table_changes(update_request.clone(), CancellationToken::new())
+        .await?;
+    assert!(update_plan.statements[0].sql.contains("$1"));
+    assert!(!update_plan.statements[0].sql.contains("alpha-edited"));
+    session
+        .apply_table_changes(update_plan, CancellationToken::new())
+        .await?;
+    let stale_plan = session
+        .plan_table_changes(update_request, CancellationToken::new())
+        .await?;
+    assert!(matches!(
+        session
+            .apply_table_changes(stale_plan, CancellationToken::new())
+            .await,
+        Err(DriverError::Conflict(_))
+    ));
 
     let root = session
         .list_objects(

@@ -7,4 +7,6 @@ pub mod error;
 pub mod metadata;
 pub mod policy;
 pub mod query;
+pub mod query_editability;
 pub mod sql;
+pub mod table_data;

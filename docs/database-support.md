@@ -7,20 +7,20 @@
 - ◐：复用兼容协议，尚未在独立真实环境完成契约验证。
 - —：当前驱动不提供该能力。
 
-CRUD 指通过查询编辑器执行数据库原生的创建、读取、更新和删除操作，不代表首版已经提供
-可视化表格编辑器。
+CRUD 指通过查询编辑器执行数据库原生的创建、读取、更新和删除操作。“表数据”表示对象树
+驱动的服务端分页浏览，以及带稳定行标识、乐观并发检查和事务提交的可视化编辑。
 
 ## 内置驱动
 
-| 数据库 | 查询方式 | CRUD | 对象树 | Estimated | Analyze | 慢查询 |
-| --- | --- | --- | --- | --- | --- | --- |
-| PostgreSQL | SQL | ✅ | ✅ | ✅ | ✅ | ⚙️ `pg_stat_statements` |
-| MySQL 8 | SQL | ✅ | ✅ | ✅ | ✅ | ⚙️ `performance_schema` |
-| MariaDB | MySQL 协议 / SQL | ◐ | ◐ | ◐ | ◐ | ◐ |
-| SQLite | SQL | ✅ | ✅ | ✅ | — | — |
-| MongoDB | JSON 操作信封 | ✅ | ✅ | ✅ | ✅ | ⚙️ 数据库 profiler |
-| Redis 7 | Redis 命令 | ✅ | ✅ `SCAN` | — | — | ⚙️ `SLOWLOG` |
-| Valkey | Redis / RESP 命令 | ◐ | ◐ `SCAN` | — | — | ◐ `SLOWLOG` |
+| 数据库 | 查询方式 | CRUD | 对象树 | 表数据 | Estimated | Analyze | 慢查询 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| PostgreSQL | SQL | ✅ | ✅ | ✅ | ✅ | ✅ | ⚙️ `pg_stat_statements` |
+| MySQL 8 | SQL | ✅ | ✅ | ✅ | ✅ | ✅ | ⚙️ `performance_schema` |
+| MariaDB | MySQL 协议 / SQL | ◐ | ◐ | ◐ | ◐ | ◐ | ◐ |
+| SQLite | SQL | ✅ | ✅ | ✅ | ✅ | — | — |
+| MongoDB | JSON 操作信封 | ✅ | ✅ | — | ✅ | ✅ | ⚙️ 数据库 profiler |
+| Redis 7 | Redis 命令 | ✅ | ✅ `SCAN` | — | — | — | ⚙️ `SLOWLOG` |
+| Valkey | Redis / RESP 命令 | ◐ | ◐ `SCAN` | — | — | — | ◐ `SLOWLOG` |
 
 为控制桌面端依赖和本地 `target/` 体积，内置范围限定为 PostgreSQL、MySQL / MariaDB、
 SQLite、MongoDB、Redis / Valkey 五类主流数据库；DuckDB、ClickHouse 不再随应用编译。
@@ -41,6 +41,9 @@ MariaDB 与 MySQL、Valkey 与 Redis 分别共享协议入口，但在声明为�
 
 - 使用 SQLx PostgreSQL 驱动。
 - 对象树覆盖 schema、表、视图、列、索引等对象。
+- 表数据读取使用服务端精确计数和分页；主键优先，否则选择全部列均非空的唯一索引。
+- 非二进制表数据由 PostgreSQL 转为规范文本显示，写回时通过目标列类型显式转换；`bytea`
+  保持二进制值。
 - 执行计划使用 JSON 格式的 `EXPLAIN` / `EXPLAIN ANALYZE`。
 - 慢查询读取 `pg_stat_statements`；服务端必须预加载并创建该扩展，当前账号还需要查询权限。
 
@@ -49,6 +52,7 @@ MariaDB 与 MySQL、Valkey 与 Redis 分别共享协议入口，但在声明为�
 - 使用 SQLx MySQL 驱动和 MySQL URL。
 - MySQL 8.4 已验证对象树、JSON 执行计划、Analyze 和
   `performance_schema.events_statements_summary_by_digest`。
+- 表数据编辑排除前缀唯一索引和函数索引，避免把不能唯一定位完整行的索引当作稳定键。
 - MariaDB 的协议兼容性较高，但执行计划 JSON、Analyze 和性能表字段可能因版本而不同，
   因此当前标记为兼容预览。
 
@@ -56,7 +60,22 @@ MariaDB 与 MySQL、Valkey 与 Redis 分别共享协议入口，但在声明为�
 
 - 使用 bundled SQLite，不依赖系统 SQLite。
 - 支持内存数据库与文件数据库、对象树和 `EXPLAIN QUERY PLAN`。
+- 表数据保留 SQLite 动态类型中的 `NULL`、文本和 BLOB；部分唯一索引与表达式唯一索引不作为
+  稳定行标识。
 - SQLite 没有跨会话的原生慢查询统计源；Analyze 模式没有被虚假映射为 Estimated。
+
+## 表数据编辑边界
+
+- 表和视图都可分页浏览；视图始终只读。
+- 普通表只有在存在非空主键或所有组成列均非空的唯一键时才可编辑。
+- 更新条件包含稳定键和被修改列的原始值；删除条件包含稳定键和结果中所有直接来源列的原始值。
+- 一批删除、更新和新增在同一事务执行。任一更新或删除未恰好影响一行时，整批回滚并返回冲突。
+- SQL 预览中的占位符、语句顺序和有序参数就是实际提交内容；数据值不会拼接进 SQL。
+- 简单单表查询在返回完整稳定键时可编辑，别名列可映射回源列，计算列保持只读。投影查询不允许
+  新增行；`SELECT *` 才允许新增。
+- JOIN、多数据源、CTE、DISTINCT、聚合、分组、集合操作、派生表、视图和缺少稳定键的结果只读，
+  界面显示具体原因。
+- 当前版本不提供外键联动编辑、批量粘贴、数据库专用类型控件或可更新视图推断。
 
 ### MongoDB
 

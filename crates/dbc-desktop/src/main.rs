@@ -2,6 +2,7 @@ mod app;
 mod drivers;
 mod export;
 mod result_table;
+mod table_editor;
 
 use eframe::egui;
 use egui_system_fonts::FontStyle;

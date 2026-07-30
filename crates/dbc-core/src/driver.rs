@@ -14,6 +14,10 @@ use crate::{
     error::DriverError,
     metadata::{ObjectListRequest, ObjectPage},
     query::QueryRequest,
+    table_data::{
+        TableApplyResult, TableBrowseRequest, TableChangePlan, TableChangeRequest, TableMetadata,
+        TablePage, TableRef,
+    },
 };
 
 pub type QueryStream = Pin<Box<dyn Stream<Item = Result<QueryEvent, DriverError>> + Send>>;
@@ -90,6 +94,38 @@ pub trait DatabaseSession: Send + Sync {
         _cancellation: CancellationToken,
     ) -> Result<SlowQueryPage, DriverError> {
         Err(DriverError::Unsupported("slow-query statistics".to_owned()))
+    }
+
+    async fn table_metadata(
+        &self,
+        _table: TableRef,
+        _cancellation: CancellationToken,
+    ) -> Result<TableMetadata, DriverError> {
+        Err(DriverError::Unsupported("editable table data".to_owned()))
+    }
+
+    async fn browse_table(
+        &self,
+        _request: TableBrowseRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<TablePage, DriverError> {
+        Err(DriverError::Unsupported("editable table data".to_owned()))
+    }
+
+    async fn plan_table_changes(
+        &self,
+        _request: TableChangeRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<TableChangePlan, DriverError> {
+        Err(DriverError::Unsupported("editable table data".to_owned()))
+    }
+
+    async fn apply_table_changes(
+        &self,
+        _plan: TableChangePlan,
+        _cancellation: CancellationToken,
+    ) -> Result<TableApplyResult, DriverError> {
+        Err(DriverError::Unsupported("editable table data".to_owned()))
     }
 
     async fn close(&self) -> Result<(), DriverError>;

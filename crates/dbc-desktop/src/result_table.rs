@@ -1,8 +1,9 @@
 use arrow_array::{
-    Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+    Array, BinaryArray, BooleanArray, Float64Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, RecordBatch, StringArray, UInt64Array,
 };
 use dbc_core::diagnostics::SlowQueryPage;
-use dbc_data::{DataBatch, DataSchema};
+use dbc_data::{CellValue, DataBatch, DataSchema};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
@@ -199,6 +200,36 @@ impl ResultGridState {
     }
 }
 
+pub(crate) fn tabular_cells(
+    schema: Option<&DataSchema>,
+    batches: &[DataBatch],
+) -> Option<(Vec<String>, Vec<Vec<CellValue>>)> {
+    let DataSchema::Tabular(schema) = schema? else {
+        return None;
+    };
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for batch in batches {
+        let DataBatch::Tabular(batch) = batch else {
+            return None;
+        };
+        for row_index in 0..batch.num_rows() {
+            rows.push(
+                batch
+                    .columns()
+                    .iter()
+                    .map(|array| array_cell_value(array.as_ref(), row_index))
+                    .collect(),
+            );
+        }
+    }
+    Some((columns, rows))
+}
+
 fn append_batch(model: &mut ResultModel, batch: &DataBatch) {
     match batch {
         DataBatch::Tabular(batch) => append_record_batch(model, batch),
@@ -270,6 +301,25 @@ fn array_value(array: &dyn Array, row_index: usize) -> String {
     format!("<{}>", array.data_type())
 }
 
+fn array_cell_value(array: &dyn Array, row_index: usize) -> CellValue {
+    if array.is_null(row_index) {
+        return CellValue::Null;
+    }
+    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        return CellValue::Text(array.value(row_index).to_owned());
+    }
+    if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return CellValue::Text(array.value(row_index).to_owned());
+    }
+    if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
+        return CellValue::Binary(array.value(row_index).to_vec());
+    }
+    if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
+        return CellValue::Binary(array.value(row_index).to_vec());
+    }
+    CellValue::Text(array_value(array, row_index))
+}
+
 fn append_message(model: &mut ResultModel, message: String) {
     if model.columns.is_empty() {
         model.columns.push("消息".to_owned());
@@ -317,7 +367,15 @@ fn truncate_display(mut value: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DISPLAY_CELL_MAX_BYTES, ResultGridState, ResultModel, truncate_display};
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, BinaryArray, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use dbc_data::{CellValue, DataBatch, DataSchema};
+
+    use super::{
+        DISPLAY_CELL_MAX_BYTES, ResultGridState, ResultModel, tabular_cells, truncate_display,
+    };
 
     #[test]
     fn display_truncation_preserves_utf8_boundaries() {
@@ -345,5 +403,33 @@ mod tests {
             rows: Vec::new(),
         });
         assert_eq!(grid.column_order, vec![0, 1]);
+    }
+
+    #[test]
+    fn editable_cells_preserve_null_text_and_binary_distinctions() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("text", DataType::Utf8, true),
+            Field::new("payload", DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("NULL"), None])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![
+                    Some(&[0_u8, 255_u8][..]),
+                    None,
+                ])) as ArrayRef,
+            ],
+        )
+        .expect("record batch should build");
+        let data = DataBatch::Tabular(batch);
+        let schema = DataSchema::from_batch(&data);
+
+        let (_, rows) = tabular_cells(Some(&schema), &[data])
+            .expect("tabular cells should be available");
+        assert_eq!(rows[0][0], CellValue::Text("NULL".to_owned()));
+        assert_eq!(rows[1][0], CellValue::Null);
+        assert_eq!(rows[0][1], CellValue::Binary(vec![0, 255]));
+        assert_eq!(rows[1][1], CellValue::Null);
     }
 }
