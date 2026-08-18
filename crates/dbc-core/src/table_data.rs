@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, time::Duration};
 
-use dbc_data::CellValue;
+use crate::result::CellValue;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;

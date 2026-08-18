@@ -7,29 +7,25 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-arrow-array.workspace = true
-base64.workspace = true
-csv.workspace = true
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "getrandom"] }
 dbc-core = { path = "../dbc-core" }
-dbc-data = { path = "../dbc-data" }
 dbc-drivers = { path = "../dbc-drivers" }
-dbc-runtime = { path = "../dbc-runtime" }
 eframe.workspace = true
-egui-system-fonts.workspace = true
 egui_code_editor.workspace = true
 egui_extras.workspace = true
 futures-util.workspace = true
-rfd.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+zeroize.workspace = true
 uuid.workspace = true
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-arrow-schema.workspace = true
+tempfile.workspace = true
 egui_kittest.workspace = true

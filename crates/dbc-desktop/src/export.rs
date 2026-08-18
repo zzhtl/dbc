@@ -5,21 +5,16 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{
-    Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
-};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use crate::atomic_file::AtomicFile;
+use crate::text_format::{encode_base64, markdown_cell, write_csv_record};
 use dbc_core::{
     driver::{DatabaseSession, QueryEvent},
     error::DriverError,
     query::QueryRequest,
 };
-use dbc_data::{DataBatch, DataSchema, ResultBuffer};
+use dbc_core::result::{DataBatch, DataSchema, ResultBuffer};
 use futures_util::TryStreamExt;
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -33,6 +28,8 @@ const EXPORT_CHANNEL_CAPACITY: usize = 8;
 pub enum ExportFormat {
     Csv,
     JsonLines,
+    /// A Markdown table, for pasting into a review or an issue.
+    Markdown,
 }
 
 impl ExportFormat {
@@ -40,6 +37,7 @@ impl ExportFormat {
         match self {
             Self::Csv => "csv",
             Self::JsonLines => "jsonl",
+            Self::Markdown => "md",
         }
     }
 
@@ -47,6 +45,7 @@ impl ExportFormat {
         match self {
             Self::Csv => "CSV",
             Self::JsonLines => "JSONL",
+            Self::Markdown => "Markdown",
         }
     }
 }
@@ -76,8 +75,6 @@ pub enum ExportError {
     NoResultSet,
     #[error("查询返回了多个不兼容的结果集")]
     IncompatibleSchema,
-    #[error("不支持导出 Arrow 类型：{0}")]
-    UnsupportedArrowType(String),
     #[error("导出超过 {limit} 行硬限制")]
     RowLimitExceeded { limit: u64 },
     #[error("导出超过 {limit} 字节硬限制")]
@@ -90,8 +87,6 @@ pub enum ExportError {
     Driver(#[from] DriverError),
     #[error("导出写入线程失败：{0}")]
     Join(String),
-    #[error("CSV 写入失败：{0}")]
-    Csv(String),
     #[error("JSON 写入失败：{0}")]
     Json(#[from] serde_json::Error),
     #[error("文件操作失败：{0}")]
@@ -206,14 +201,10 @@ fn write_atomic(
     cancellation: Option<&CancellationToken>,
 ) -> Result<ExportSummary, ExportError> {
     check_cancellation(cancellation)?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut temporary = NamedTempFile::new_in(parent).map_err(map_io)?;
+    let mut temporary = AtomicFile::create(path).map_err(map_io)?;
 
     let (rows, bytes) = {
-        let limited = LimitedWriter::new(temporary.as_file_mut(), limits.max_bytes);
+        let limited = LimitedWriter::new(temporary.writer(), limits.max_bytes);
         let mut writer = ExportWriter::new(format, limited, limits.max_rows);
         match source {
             ExportSource::Buffer { schema, buffer } => {
@@ -248,9 +239,9 @@ fn write_atomic(
     };
 
     check_cancellation(cancellation)?;
-    temporary.as_file_mut().sync_all().map_err(map_io)?;
-    check_cancellation(cancellation)?;
-    temporary.persist(path).map_err(|error| map_io(error.error))?;
+    // `commit` flushes, syncs and renames; dropping without it leaves the
+    // existing target untouched.
+    temporary.commit().map_err(map_io)?;
     Ok(ExportSummary { rows, bytes })
 }
 
@@ -267,6 +258,7 @@ fn check_cancellation(
 enum ExportWriter<W: Write> {
     Csv(Box<CsvExporter<W>>),
     JsonLines(JsonLinesExporter<W>),
+    Markdown(Box<MarkdownExporter<W>>),
 }
 
 impl<W: Write> ExportWriter<W> {
@@ -276,6 +268,9 @@ impl<W: Write> ExportWriter<W> {
             ExportFormat::JsonLines => {
                 Self::JsonLines(JsonLinesExporter::new(writer, max_rows))
             }
+            ExportFormat::Markdown => {
+                Self::Markdown(Box::new(MarkdownExporter::new(writer, max_rows)))
+            }
         }
     }
 
@@ -283,6 +278,7 @@ impl<W: Write> ExportWriter<W> {
         match self {
             Self::Csv(writer) => writer.write_schema(schema),
             Self::JsonLines(writer) => writer.write_schema(schema),
+            Self::Markdown(writer) => writer.write_schema(schema),
         }
     }
 
@@ -290,6 +286,7 @@ impl<W: Write> ExportWriter<W> {
         match self {
             Self::Csv(writer) => writer.write_batch(batch),
             Self::JsonLines(writer) => writer.write_batch(batch),
+            Self::Markdown(writer) => writer.write_batch(batch),
         }
     }
 
@@ -297,12 +294,13 @@ impl<W: Write> ExportWriter<W> {
         match self {
             Self::Csv(writer) => writer.finish(),
             Self::JsonLines(writer) => writer.finish(),
+            Self::Markdown(writer) => writer.finish(),
         }
     }
 }
 
 struct CsvExporter<W: Write> {
-    writer: csv::Writer<W>,
+    writer: W,
     schema: Option<DataSchema>,
     rows: u64,
     max_rows: u64,
@@ -311,7 +309,7 @@ struct CsvExporter<W: Write> {
 impl<W: Write> CsvExporter<W> {
     fn new(writer: W, max_rows: u64) -> Self {
         Self {
-            writer: csv::WriterBuilder::new().from_writer(writer),
+            writer,
             schema: None,
             rows: 0,
             max_rows,
@@ -323,18 +321,18 @@ impl<W: Write> CsvExporter<W> {
             return ensure_compatible_schema(existing, schema);
         }
         match schema {
-            DataSchema::Tabular(schema) => self
-                .writer
-                .write_record(schema.fields().iter().map(|field| field.name()))
-                .map_err(map_csv)?,
-            DataSchema::Documents => self
-                .writer
-                .write_record(["document"])
-                .map_err(map_csv)?,
-            DataSchema::KeyValues => self
-                .writer
-                .write_record(["key", "value", "type", "ttl_millis"])
-                .map_err(map_csv)?,
+            DataSchema::Tabular(schema) => write_csv_record(
+                &mut self.writer,
+                schema.iter().map(|column| column.name.as_str()),
+            )
+            .map_err(map_io)?,
+            DataSchema::Documents => {
+                write_csv_record(&mut self.writer, ["document"]).map_err(map_io)?;
+            }
+            DataSchema::KeyValues => {
+                write_csv_record(&mut self.writer, ["key", "value", "type", "ttl_millis"])
+                    .map_err(map_io)?;
+            }
         }
         self.schema = Some(schema.clone());
         Ok(())
@@ -344,40 +342,39 @@ impl<W: Write> CsvExporter<W> {
         self.ensure_batch_schema(batch)?;
         match batch {
             DataBatch::Tabular(batch) => {
-                for row_index in 0..batch.num_rows() {
+                for row in 0..batch.row_count() {
                     self.check_row_limit()?;
-                    let record = batch
-                        .columns()
-                        .iter()
-                        .map(|array| csv_cell(array.as_ref(), row_index))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    self.writer.write_record(record).map_err(map_csv)?;
+                    let record = (0..batch.column_count())
+                        .map(|column| batch.value(row, column).unwrap_or_default())
+                        .collect::<Vec<_>>();
+                    write_csv_record(&mut self.writer, record).map_err(map_io)?;
                     self.rows += 1;
                 }
             }
             DataBatch::Documents(documents) => {
                 for document in documents {
                     self.check_row_limit()?;
-                    self.writer
-                        .write_record([serde_json::to_string(document)?])
-                        .map_err(map_csv)?;
+                    write_csv_record(&mut self.writer, [serde_json::to_string(document)?])
+                        .map_err(map_io)?;
                     self.rows += 1;
                 }
             }
             DataBatch::KeyValues(entries) => {
                 for entry in entries {
                     self.check_row_limit()?;
-                    self.writer
-                        .write_record([
-                            BASE64.encode(&entry.key),
-                            BASE64.encode(&entry.value),
+                    write_csv_record(
+                        &mut self.writer,
+                        [
+                            encode_base64(&entry.key),
+                            encode_base64(&entry.value),
                             entry.value_type.clone(),
                             entry
                                 .ttl_millis
                                 .map(|ttl| ttl.to_string())
                                 .unwrap_or_default(),
-                        ])
-                        .map_err(map_csv)?;
+                        ],
+                    )
+                    .map_err(map_io)?;
                     self.rows += 1;
                 }
             }
@@ -402,11 +399,7 @@ impl<W: Write> CsvExporter<W> {
 
     fn finish(mut self) -> Result<(W, u64), ExportError> {
         self.writer.flush().map_err(map_io)?;
-        let writer = self
-            .writer
-            .into_inner()
-            .map_err(|error| map_io(error.into_error()))?;
-        Ok((writer, self.rows))
+        Ok((self.writer, self.rows))
     }
 }
 
@@ -433,14 +426,12 @@ impl<W: Write> JsonLinesExporter<W> {
         }
         if let DataSchema::Tabular(schema) = schema {
             let columns = schema
-                .fields()
                 .iter()
-                .map(|field| field.name())
+                .map(|column| column.name.as_str())
                 .collect::<Vec<_>>();
             let types = schema
-                .fields()
                 .iter()
-                .map(|field| field.data_type().to_string())
+                .map(|column| column.database_type.as_str())
                 .collect::<Vec<_>>();
             write_json_line(
                 &mut self.writer,
@@ -459,13 +450,14 @@ impl<W: Write> JsonLinesExporter<W> {
         self.ensure_batch_schema(batch)?;
         match batch {
             DataBatch::Tabular(batch) => {
-                for row_index in 0..batch.num_rows() {
+                for row in 0..batch.row_count() {
                     self.check_row_limit()?;
-                    let values = batch
-                        .columns()
-                        .iter()
-                        .map(|array| json_cell(array.as_ref(), row_index))
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let values = (0..batch.column_count())
+                        .map(|column| match batch.value(row, column) {
+                            Some(text) => Value::String(text.to_owned()),
+                            None => Value::Null,
+                        })
+                        .collect::<Vec<_>>();
                     write_json_line(&mut self.writer, &json!({ "values": values }))?;
                     self.rows += 1;
                 }
@@ -483,8 +475,8 @@ impl<W: Write> JsonLinesExporter<W> {
                     write_json_line(
                         &mut self.writer,
                         &json!({
-                            "key": BASE64.encode(&entry.key),
-                            "value": BASE64.encode(&entry.value),
+                            "key": encode_base64(&entry.key),
+                            "value": encode_base64(&entry.value),
                             "type": entry.value_type,
                             "ttl_millis": entry.ttl_millis,
                         }),
@@ -517,6 +509,119 @@ impl<W: Write> JsonLinesExporter<W> {
     }
 }
 
+/// A GitHub-flavoured Markdown table, for pasting into a review or an issue.
+struct MarkdownExporter<W: Write> {
+    writer: W,
+    schema: Option<DataSchema>,
+    columns: usize,
+    rows: u64,
+    max_rows: u64,
+}
+
+impl<W: Write> MarkdownExporter<W> {
+    fn new(writer: W, max_rows: u64) -> Self {
+        Self {
+            writer,
+            schema: None,
+            columns: 0,
+            rows: 0,
+            max_rows,
+        }
+    }
+
+    fn write_header(&mut self, headers: &[String]) -> Result<(), ExportError> {
+        self.columns = headers.len();
+        self.write_row(headers)?;
+        let separator = headers.iter().map(|_| "---".to_owned()).collect::<Vec<_>>();
+        self.write_row(&separator)
+    }
+
+    fn write_row(&mut self, cells: &[String]) -> Result<(), ExportError> {
+        self.writer.write_all(b"|").map_err(map_io)?;
+        for cell in cells {
+            self.writer
+                .write_all(format!(" {} |", markdown_cell(cell)).as_bytes())
+                .map_err(map_io)?;
+        }
+        self.writer.write_all(b"\n").map_err(map_io)
+    }
+
+    fn write_schema(&mut self, schema: &DataSchema) -> Result<(), ExportError> {
+        if let Some(existing) = self.schema.as_ref() {
+            return ensure_compatible_schema(existing, schema);
+        }
+        let headers = match schema {
+            DataSchema::Tabular(schema) => {
+                schema.iter().map(|column| column.name.clone()).collect()
+            }
+            DataSchema::Documents => vec!["document".to_owned()],
+            DataSchema::KeyValues => vec![
+                "key".to_owned(),
+                "value".to_owned(),
+                "type".to_owned(),
+                "ttl_millis".to_owned(),
+            ],
+        };
+        self.write_header(&headers)?;
+        self.schema = Some(schema.clone());
+        Ok(())
+    }
+
+    fn write_batch(&mut self, batch: &DataBatch) -> Result<(), ExportError> {
+        let inferred = DataSchema::from_batch(batch);
+        self.write_schema(&inferred)?;
+        match batch {
+            DataBatch::Tabular(batch) => {
+                for row in 0..batch.row_count() {
+                    self.check_row_limit()?;
+                    let cells = (0..batch.column_count())
+                        .map(|column| batch.value(row, column).unwrap_or_default().to_owned())
+                        .collect::<Vec<_>>();
+                    self.write_row(&cells)?;
+                    self.rows += 1;
+                }
+            }
+            DataBatch::Documents(documents) => {
+                for document in documents {
+                    self.check_row_limit()?;
+                    self.write_row(&[serde_json::to_string(document)?])?;
+                    self.rows += 1;
+                }
+            }
+            DataBatch::KeyValues(entries) => {
+                for entry in entries {
+                    self.check_row_limit()?;
+                    self.write_row(&[
+                        encode_base64(&entry.key),
+                        encode_base64(&entry.value),
+                        entry.value_type.clone(),
+                        entry
+                            .ttl_millis
+                            .map(|ttl| ttl.to_string())
+                            .unwrap_or_default(),
+                    ])?;
+                    self.rows += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_row_limit(&self) -> Result<(), ExportError> {
+        if self.rows >= self.max_rows {
+            return Err(ExportError::RowLimitExceeded {
+                limit: self.max_rows,
+            });
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(W, u64), ExportError> {
+        self.writer.flush().map_err(map_io)?;
+        Ok((self.writer, self.rows))
+    }
+}
+
 fn ensure_compatible_schema(
     existing: &DataSchema,
     incoming: &DataSchema,
@@ -538,103 +643,6 @@ fn write_json_line<W: Write>(writer: &mut W, value: &Value) -> Result<(), Export
     let encoded = serde_json::to_vec(value)?;
     writer.write_all(&encoded).map_err(map_io)?;
     writer.write_all(b"\n").map_err(map_io)
-}
-
-fn csv_cell(array: &dyn Array, row_index: usize) -> Result<String, ExportError> {
-    if array.is_null(row_index) {
-        return Ok(String::new());
-    }
-    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok(array.value(row_index).to_owned());
-    }
-    if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
-        return Ok(array.value(row_index).to_owned());
-    }
-    if let Some(array) = array.as_any().downcast_ref::<BooleanArray>() {
-        return Ok(array.value(row_index).to_string());
-    }
-    macro_rules! numeric_cell {
-        ($array_type:ty) => {
-            if let Some(array) = array.as_any().downcast_ref::<$array_type>() {
-                return Ok(array.value(row_index).to_string());
-            }
-        };
-    }
-    numeric_cell!(Int8Array);
-    numeric_cell!(Int16Array);
-    numeric_cell!(Int32Array);
-    numeric_cell!(Int64Array);
-    numeric_cell!(UInt8Array);
-    numeric_cell!(UInt16Array);
-    numeric_cell!(UInt32Array);
-    numeric_cell!(UInt64Array);
-    numeric_cell!(Float32Array);
-    numeric_cell!(Float64Array);
-    if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
-        return Ok(BASE64.encode(array.value(row_index)));
-    }
-    if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Ok(BASE64.encode(array.value(row_index)));
-    }
-    Err(ExportError::UnsupportedArrowType(
-        array.data_type().to_string(),
-    ))
-}
-
-fn json_cell(array: &dyn Array, row_index: usize) -> Result<Value, ExportError> {
-    if array.is_null(row_index) {
-        return Ok(Value::Null);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok(Value::String(array.value(row_index).to_owned()));
-    }
-    if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
-        return Ok(Value::String(array.value(row_index).to_owned()));
-    }
-    if let Some(array) = array.as_any().downcast_ref::<BooleanArray>() {
-        return Ok(Value::Bool(array.value(row_index)));
-    }
-    macro_rules! integer_cell {
-        ($array_type:ty) => {
-            if let Some(array) = array.as_any().downcast_ref::<$array_type>() {
-                return Ok(Value::from(array.value(row_index)));
-            }
-        };
-    }
-    integer_cell!(Int8Array);
-    integer_cell!(Int16Array);
-    integer_cell!(Int32Array);
-    integer_cell!(Int64Array);
-    integer_cell!(UInt8Array);
-    integer_cell!(UInt16Array);
-    integer_cell!(UInt32Array);
-    integer_cell!(UInt64Array);
-    macro_rules! float_cell {
-        ($array_type:ty) => {
-            if let Some(array) = array.as_any().downcast_ref::<$array_type>() {
-                let value = f64::from(array.value(row_index));
-                return Ok(serde_json::Number::from_f64(value)
-                    .map(Value::Number)
-                    .unwrap_or_else(|| Value::String(value.to_string())));
-            }
-        };
-    }
-    float_cell!(Float32Array);
-    if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
-        let value = array.value(row_index);
-        return Ok(serde_json::Number::from_f64(value)
-            .map(Value::Number)
-            .unwrap_or_else(|| Value::String(value.to_string())));
-    }
-    if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
-        return Ok(Value::String(BASE64.encode(array.value(row_index))));
-    }
-    if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Ok(Value::String(BASE64.encode(array.value(row_index))));
-    }
-    Err(ExportError::UnsupportedArrowType(
-        array.data_type().to_string(),
-    ))
 }
 
 struct LimitedWriter<W> {
@@ -701,21 +709,11 @@ fn map_io(error: io::Error) -> ExportError {
     }
 }
 
-fn map_csv(error: csv::Error) -> ExportError {
-    let message = error.to_string();
-    match error.into_kind() {
-        csv::ErrorKind::Io(error) => map_io(error),
-        _ => ExportError::Csv(message),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Int64Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
-    use dbc_data::{BufferLimits, KeyValueEntry};
+    use dbc_core::result::{BufferLimits, ColumnSchema, KeyValueEntry, RowBatchBuilder};
     use serde_json::{Value, json};
     use tokio_util::sync::CancellationToken;
 
@@ -723,26 +721,25 @@ mod tests {
         ExportError, ExportFormat, ExportLimits, export_buffer,
         export_buffer_cancellable,
     };
-    use dbc_data::{DataBatch, DataSchema, ResultBuffer};
+    use dbc_core::result::{DataBatch, DataSchema, ResultBuffer};
 
     fn tabular_buffer() -> (DataSchema, ResultBuffer) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("duplicate", DataType::Int64, true),
-            Field::new("duplicate", DataType::Utf8, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![Some(1), None])),
-                Arc::new(StringArray::from(vec![Some("nested"), Some("value")])),
-            ],
-        )
-        .expect("tabular fixture should be valid");
+        let schema: Arc<[ColumnSchema]> = vec![
+            ColumnSchema::new("duplicate", "bigint"),
+            ColumnSchema::new("duplicate", "text"),
+        ]
+        .into();
+        let mut builder = RowBatchBuilder::new(Arc::clone(&schema), 2);
+        for row in [[Some("1"), Some("nested")], [None, Some("value")]] {
+            builder
+                .push_row(|index| Ok::<_, ()>(row[index].map(str::to_owned)))
+                .expect("tabular fixture should decode");
+        }
         let mut buffer = ResultBuffer::new(BufferLimits {
             max_rows: 100,
             max_bytes: usize::MAX,
         });
-        let _outcome = buffer.append(DataBatch::Tabular(batch));
+        let _outcome = buffer.append(DataBatch::Tabular(builder.take_batch()));
         (DataSchema::Tabular(schema), buffer)
     }
 
@@ -801,7 +798,42 @@ mod tests {
             schema_line["columns"],
             json!(["duplicate", "duplicate"])
         );
+        assert_eq!(schema_line["types"], json!(["bigint", "text"]));
         assert_eq!(second_row["values"], json!([null, "value"]));
+    }
+
+    #[test]
+    fn markdown_export_writes_a_table_and_escapes_pipes() {
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let path = directory.path().join("result.md");
+        let schema: Arc<[ColumnSchema]> = vec![ColumnSchema::new("note", "text")].into();
+        let mut builder = RowBatchBuilder::new(Arc::clone(&schema), 2);
+        for value in [Some("a|b"), None] {
+            builder
+                .push_row(|_| Ok::<_, ()>(value.map(str::to_owned)))
+                .expect("fixture rows should decode");
+        }
+        let mut buffer = ResultBuffer::new(BufferLimits {
+            max_rows: 100,
+            max_bytes: usize::MAX,
+        });
+        let _outcome = buffer.append(DataBatch::Tabular(builder.take_batch()));
+
+        export_buffer(
+            &path,
+            ExportFormat::Markdown,
+            Some(&DataSchema::Tabular(schema)),
+            &buffer,
+            ExportLimits {
+                max_rows: 100,
+                max_bytes: 1024 * 1024,
+            },
+        )
+        .expect("Markdown export should succeed");
+
+        let content = std::fs::read_to_string(path).expect("Markdown should be readable");
+
+        assert_eq!(content, "| note |\n| --- |\n| a\\|b |\n|  |\n");
     }
 
     #[test]

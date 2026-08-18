@@ -7,7 +7,7 @@ use dbc_core::{
     metadata::{DatabaseObjectKind, ObjectListRequest, ObjectPath},
     query::QueryRequest,
 };
-use dbc_data::DataBatch;
+use dbc_core::result::DataBatch;
 use dbc_drivers::MongoFactory;
 use futures_util::TryStreamExt;
 use tokio_util::sync::CancellationToken;
@@ -17,6 +17,9 @@ use uuid::Uuid;
 #[ignore = "requires DBC_TEST_MONGODB_URL"]
 async fn mongodb_vertical_contract() -> Result<(), Box<dyn std::error::Error>> {
     let Ok(endpoint) = env::var("DBC_TEST_MONGODB_URL") else {
+        // Running with `--ignored` but no environment used to report a green
+        // pass while testing nothing at all.
+        eprintln!("skipped: DBC_TEST_MONGODB_URL is not set");
         return Ok(());
     };
     let factory = MongoFactory::new();
@@ -59,6 +62,23 @@ async fn mongodb_vertical_contract() -> Result<(), Box<dyn std::error::Error>> {
     assert!(updated
         .iter()
         .any(|event| matches!(event, QueryEvent::AffectedRows(2))));
+
+    // The shell form must reach the server, not just parse: it is the syntax
+    // the editor now offers by default.
+    let shell_found = execute_to_end(
+        &session,
+        r#"db.items.find({"active": true}).sort({"id": 1}).limit(10)"#,
+    )
+    .await?;
+    let shell_documents = shell_found
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::Rows(DataBatch::Documents(documents)) => Some(documents),
+            _ => None,
+        })
+        .expect("shell find should return documents");
+    assert_eq!(shell_documents.len(), 2);
+    assert_eq!(shell_documents[0]["name"], serde_json::json!("alpha"));
 
     let found = execute_to_end(
         &session,

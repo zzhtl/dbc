@@ -6,8 +6,9 @@ Accepted
 
 ## 背景
 
-DBC 需要参考 DBX 的数据浏览体验，为 PostgreSQL、MySQL / MariaDB 和 SQLite 增加表格编辑，
-同时避免把任意查询结果误判为可更新数据。主要风险包括：
+在表格里直接改数据是数据库客户端最高频的操作之一，也是最容易做错的一个：把任意查询
+结果当成可更新数据，轻则改错行，重则静默丢失并发写入。本 ADR 为 PostgreSQL、
+MySQL / MariaDB 和 SQLite 定义这个能力的安全边界。主要风险包括：
 
 - 分页结果没有稳定顺序，翻页时重复或遗漏行。
 - 没有主键的表无法唯一定位用户正在编辑的行。
@@ -121,4 +122,3 @@ SQL AST 只接受单一普通表来源。直接列和别名列可映射回源列
 
 - [ADR-0001：模块化数据库驱动架构](0001-modular-driver-architecture.md)
 - [数据库支持矩阵](../database-support.md)
-- [DBX 参考项目](https://github.com/t8y2/dbx)

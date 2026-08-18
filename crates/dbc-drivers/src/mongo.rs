@@ -23,7 +23,7 @@ use dbc_core::{
     },
     query::QueryRequest,
 };
-use dbc_data::{DataBatch, DataSchema};
+use dbc_core::result::{DataBatch, DataSchema};
 use futures_util::TryStreamExt;
 use mongodb::{
     Client,
@@ -675,10 +675,288 @@ fn operation_deadline(duration: Duration) -> Result<Instant, DriverError> {
         .ok_or_else(|| DriverError::Query("operation timeout is too large".to_owned()))
 }
 
+/// Accept either the shell form or the JSON operation envelope.
 fn parse_operation(text: &str) -> Result<MongoOperation, DriverError> {
-    serde_json::from_str(text)
+    let trimmed = text.trim();
+    if trimmed.starts_with("db.") {
+        return parse_shell_operation(trimmed);
+    }
+    serde_json::from_str(trimmed)
         .map_err(|error| DriverError::Query(format!("invalid MongoDB operation JSON: {error}")))
 }
+
+/// Parse the `db.<collection>.<method>(...)` form used by the MongoDB shell.
+///
+/// Hand-writing `{"operation": "find", "collection": "items", ...}` is the
+/// least intuitive thing this client asked of anyone, so the editor accepts the
+/// shell form as well. Arguments must be valid JSON — the shell's unquoted keys
+/// are not accepted, and the parser says so rather than guessing.
+fn parse_shell_operation(text: &str) -> Result<MongoOperation, DriverError> {
+    let text = text.trim().trim_end_matches(';').trim();
+    let rest = text
+        .strip_prefix("db.")
+        .ok_or_else(|| shell_error("a shell operation must start with `db.`"))?;
+
+    let (head, mut rest) = split_call(rest)?;
+    // `db.runCommand({...})` has no collection; everything else does.
+    let (collection, method, arguments) = if head.name == "runCommand" {
+        (None, head.name.clone(), head.arguments)
+    } else {
+        let collection = head.name;
+        let (call, tail) = split_call(rest)?;
+        rest = tail;
+        (Some(collection), call.name, call.arguments)
+    };
+
+    let mut modifiers = ShellModifiers::default();
+    while !rest.trim().is_empty() {
+        let (call, tail) = split_call(rest)?;
+        modifiers.apply(&call)?;
+        rest = tail;
+    }
+
+    build_operation(collection, &method, &arguments, modifiers)
+}
+
+fn shell_error(message: &str) -> DriverError {
+    DriverError::Query(format!("invalid MongoDB shell operation: {message}"))
+}
+
+struct ShellCall {
+    name: String,
+    arguments: Vec<String>,
+}
+
+/// Split `.name(args)` (or a leading `name` before the first call) off the front.
+fn split_call(input: &str) -> Result<(ShellCall, &str), DriverError> {
+    let input = input.trim_start();
+    let input = input.strip_prefix('.').unwrap_or(input);
+    let name_end = input
+        .find(|character: char| !character.is_alphanumeric() && character != '_' && character != '$')
+        .unwrap_or(input.len());
+    let name = input[..name_end].to_owned();
+    if name.is_empty() {
+        return Err(shell_error("expected a collection or method name"));
+    }
+    let rest = input[name_end..].trim_start();
+    let Some(rest) = rest.strip_prefix('(') else {
+        // A bare name: the collection in `db.items.find(...)`.
+        return Ok((
+            ShellCall {
+                name,
+                arguments: Vec::new(),
+            },
+            &input[name_end..],
+        ));
+    };
+    let (inside, tail) = split_balanced(rest)?;
+    Ok((
+        ShellCall {
+            name,
+            arguments: split_arguments(inside)?,
+        },
+        tail,
+    ))
+}
+
+/// Return the text up to the `)` that closes the already-consumed `(`.
+fn split_balanced(input: &str) -> Result<(&str, &str), DriverError> {
+    let mut depth = 1_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, character) in input.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok((&input[..offset], &input[offset + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(shell_error("unbalanced parentheses"))
+}
+
+/// Split top-level comma-separated arguments.
+fn split_arguments(input: &str) -> Result<Vec<String>, DriverError> {
+    let mut arguments = Vec::new();
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut start = 0_usize;
+    for (offset, character) in input.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                arguments.push(input[start..offset].trim().to_owned());
+                start = offset + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = input[start..].trim();
+    if !last.is_empty() {
+        arguments.push(last.to_owned());
+    }
+    Ok(arguments)
+}
+
+#[derive(Default)]
+struct ShellModifiers {
+    limit: Option<u64>,
+    skip: Option<u64>,
+    sort: Option<Document>,
+}
+
+impl ShellModifiers {
+    fn apply(&mut self, call: &ShellCall) -> Result<(), DriverError> {
+        let argument = call.arguments.first().map(String::as_str).unwrap_or("");
+        match call.name.as_str() {
+            "limit" => self.limit = Some(parse_shell_u64(argument, "limit")?),
+            "skip" => self.skip = Some(parse_shell_u64(argument, "skip")?),
+            "sort" => self.sort = Some(parse_shell_document(argument, "sort")?),
+            other => {
+                return Err(shell_error(&format!(
+                    "unsupported modifier `{other}`; use limit, skip or sort"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_shell_u64(argument: &str, field: &str) -> Result<u64, DriverError> {
+    argument
+        .trim()
+        .parse()
+        .map_err(|_| shell_error(&format!("`{field}` expects a non-negative integer")))
+}
+
+fn parse_shell_document(argument: &str, field: &str) -> Result<Document, DriverError> {
+    if argument.trim().is_empty() {
+        return Ok(Document::new());
+    }
+    serde_json::from_str(argument).map_err(|error| {
+        shell_error(&format!(
+            "`{field}` must be a JSON document (quote the keys): {error}"
+        ))
+    })
+}
+
+fn parse_shell_pipeline(argument: &str) -> Result<Vec<Document>, DriverError> {
+    serde_json::from_str(argument)
+        .map_err(|error| shell_error(&format!("`aggregate` expects a JSON array: {error}")))
+}
+
+fn build_operation(
+    collection: Option<String>,
+    method: &str,
+    arguments: &[String],
+    modifiers: ShellModifiers,
+) -> Result<MongoOperation, DriverError> {
+    let argument = |index: usize| arguments.get(index).map(String::as_str).unwrap_or("");
+    if method == "runCommand" {
+        return Ok(MongoOperation::RunCommand {
+            database: None,
+            command: parse_shell_document(argument(0), "runCommand")?,
+        });
+    }
+    let collection =
+        collection.ok_or_else(|| shell_error("expected `db.<collection>.<method>(...)`"))?;
+
+    Ok(match method {
+        "find" => MongoOperation::Find {
+            database: None,
+            collection,
+            filter: parse_shell_document(argument(0), "filter")?,
+            projection: (arguments.len() > 1)
+                .then(|| parse_shell_document(argument(1), "projection"))
+                .transpose()?,
+            sort: modifiers.sort,
+            skip: modifiers.skip,
+            limit: modifiers.limit,
+        },
+        "aggregate" => MongoOperation::Aggregate {
+            database: None,
+            collection,
+            pipeline: parse_shell_pipeline(argument(0))?,
+        },
+        "insertOne" => MongoOperation::InsertOne {
+            database: None,
+            collection,
+            document: parse_shell_document(argument(0), "document")?,
+        },
+        "updateOne" | "updateMany" => {
+            let filter = parse_shell_document(argument(0), "filter")?;
+            let update = parse_shell_document(argument(1), "update")?;
+            let upsert = arguments
+                .get(2)
+                .map(|options| parse_shell_document(options, "options"))
+                .transpose()?
+                .and_then(|options| options.get_bool("upsert").ok())
+                .unwrap_or(false);
+            if method == "updateOne" {
+                MongoOperation::UpdateOne {
+                    database: None,
+                    collection,
+                    filter,
+                    update,
+                    upsert,
+                }
+            } else {
+                MongoOperation::UpdateMany {
+                    database: None,
+                    collection,
+                    filter,
+                    update,
+                    upsert,
+                }
+            }
+        }
+        "deleteOne" => MongoOperation::DeleteOne {
+            database: None,
+            collection,
+            filter: parse_shell_document(argument(0), "filter")?,
+        },
+        "deleteMany" => MongoOperation::DeleteMany {
+            database: None,
+            collection,
+            filter: parse_shell_document(argument(0), "filter")?,
+        },
+        other => {
+            return Err(shell_error(&format!(
+                "unsupported method `{other}`; supported: find, aggregate, insertOne, \
+                 updateOne, updateMany, deleteOne, deleteMany, runCommand"
+            )));
+        }
+    })
+}
+
 
 fn validate_operation(
     operation: &MongoOperation,
@@ -952,6 +1230,97 @@ fn usize_to_u64(value: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn shell_find_accepts_chained_modifiers() {
+        let operation = parse_operation(
+            r#"db.items.find({"name": "alpha"}).limit(100).skip(5).sort({"id": 1})"#,
+        )
+        .expect("shell find should parse");
+
+        match operation {
+            MongoOperation::Find {
+                collection,
+                filter,
+                projection,
+                sort,
+                skip,
+                limit,
+                ..
+            } => {
+                assert_eq!(collection, "items");
+                assert_eq!(filter.get_str("name").ok(), Some("alpha"));
+                assert!(projection.is_none());
+                assert_eq!(sort.and_then(|sort| sort.get_i32("id").ok()), Some(1));
+                assert_eq!(skip, Some(5));
+                assert_eq!(limit, Some(100));
+            }
+            other => panic!("expected a find operation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shell_find_takes_an_optional_projection() {
+        let operation = parse_operation(r#"db.items.find({}, {"name": 1})"#)
+            .expect("shell find with projection should parse");
+
+        match operation {
+            MongoOperation::Find { projection, .. } => {
+                assert_eq!(
+                    projection.and_then(|projection| projection.get_i32("name").ok()),
+                    Some(1)
+                );
+            }
+            other => panic!("expected a find operation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shell_supports_aggregate_update_and_run_command() {
+        assert!(matches!(
+            parse_operation(r#"db.items.aggregate([{"$match": {}}, {"$limit": 5}])"#),
+            Ok(MongoOperation::Aggregate { pipeline, .. }) if pipeline.len() == 2
+        ));
+        assert!(matches!(
+            parse_operation(
+                r#"db.items.updateMany({"id": 1}, {"$set": {"name": "x"}}, {"upsert": true})"#
+            ),
+            Ok(MongoOperation::UpdateMany { upsert: true, .. })
+        ));
+        assert!(matches!(
+            parse_operation(r#"db.runCommand({"ping": 1});"#),
+            Ok(MongoOperation::RunCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn the_json_envelope_still_works() {
+        assert!(matches!(
+            parse_operation(r#"{"operation": "find", "collection": "items"}"#),
+            Ok(MongoOperation::Find { .. })
+        ));
+    }
+
+    #[test]
+    fn shell_errors_name_the_problem_instead_of_guessing() {
+        // Unquoted keys are the shell's own relaxed JSON; say so rather than
+        // silently reinterpreting the query.
+        let error = parse_operation("db.items.find({name: 1})")
+            .expect_err("relaxed JSON must be rejected");
+        assert!(error.to_string().contains("quote the keys"), "{error}");
+
+        let error = parse_operation("db.items.upsertOne({})")
+            .expect_err("unknown methods must be rejected");
+        assert!(error.to_string().contains("unsupported method"), "{error}");
+
+        let error = parse_operation("db.items.find({}).page(2)")
+            .expect_err("unknown modifiers must be rejected");
+        assert!(error.to_string().contains("unsupported modifier"), "{error}");
+
+        let error =
+            parse_operation("db.items.find({}").expect_err("unbalanced input must be rejected");
+        assert!(error.to_string().contains("unbalanced"), "{error}");
+    }
     use super::{MongoOperation, index_name_from_keys, parse_operation};
     use mongodb::bson::doc;
 

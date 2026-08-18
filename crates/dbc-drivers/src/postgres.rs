@@ -1,15 +1,12 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fmt::Display,
     future::Future,
-    mem,
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
@@ -39,7 +36,7 @@ use dbc_core::{
         TableStatementKind, UniqueKey,
     },
 };
-use dbc_data::{CellValue, DataBatch, DataSchema};
+use dbc_core::result::{CellValue, ColumnSchema, DataBatch, DataSchema, RowBatchBuilder};
 use futures_util::TryStreamExt;
 use sqlx::{
     AssertSqlSafe, Column, Decode, Either, Error as SqlxError, Executor, Postgres, Row,
@@ -393,15 +390,33 @@ impl DatabaseSession for PostgresSession {
             let started = Instant::now();
             let mut returned_rows = 0_u64;
             let mut affected_rows = 0_u64;
+            // Pin the query to one connection so a cancellation knows which
+            // backend to stop; without this the request only stopped being read
+            // client-side and kept running to completion on the server.
+            let mut connection = controlled(deadline, &cancellation, pool.acquire())
+                .await?
+                .map_err(map_query_error)?;
+            let backend_pid = controlled(
+                deadline,
+                &cancellation,
+                sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+                    .fetch_one(&mut *connection),
+            )
+            .await?
+            .map_err(map_query_error)?;
+            let _cancel_guard =
+                NativeCancelGuard::spawn(pool.clone(), cancellation.clone(), backend_pid);
+
             let statement = controlled(
                 deadline,
                 &cancellation,
-                pool.prepare(AssertSqlSafe(text.as_str()).into_sql_str()),
+                connection.prepare(AssertSqlSafe(text.as_str()).into_sql_str()),
             )
             .await?
             .map_err(map_query_error)?;
             let returns_rows = !statement.columns().is_empty();
-            let mut batch = TextBatchBuilder::from_columns(statement.columns());
+            let mut batch =
+                RowBatchBuilder::new(column_schema(statement.columns()), QUERY_BATCH_ROWS);
             if returns_rows {
                 yield QueryEvent::Schema(DataSchema::Tabular(batch.schema()));
             }
@@ -409,7 +424,7 @@ impl DatabaseSession for PostgresSession {
 
             // Editor input reaches this boundary only after DBC policy evaluation.
             let mut results =
-                sqlx::raw_sql(AssertSqlSafe(text.as_str())).fetch_many(&pool);
+                sqlx::raw_sql(AssertSqlSafe(text.as_str())).fetch_many(&mut *connection);
             while returned_rows < usize_to_u64(row_limit) {
                 let next = controlled(deadline, &cancellation, results.try_next())
                     .await?
@@ -419,17 +434,12 @@ impl DatabaseSession for PostgresSession {
                 };
                 match result {
                     Either::Right(row) => {
-                        batch.push(&row)?;
+                        batch.push_row(|index| decode_cell(&row, index))?;
                         returned_rows = returned_rows.saturating_add(1);
                         if batch.len() >= QUERY_BATCH_ROWS
                             || returned_rows >= usize_to_u64(row_limit)
                         {
-                            let finished_batch = mem::replace(
-                                &mut batch,
-                                TextBatchBuilder::from_columns(row.columns()),
-                            )
-                            .finish()?;
-                            yield QueryEvent::Rows(DataBatch::Tabular(finished_batch));
+                            yield QueryEvent::Rows(DataBatch::Tabular(batch.take_batch()));
                         }
                     }
                     Either::Left(result) => {
@@ -442,7 +452,7 @@ impl DatabaseSession for PostgresSession {
                 }
             }
             if !batch.is_empty() {
-                yield QueryEvent::Rows(DataBatch::Tabular(batch.finish()?));
+                yield QueryEvent::Rows(DataBatch::Tabular(batch.take_batch()));
             }
 
             yield QueryEvent::Finished(QueryStats {
@@ -817,6 +827,41 @@ impl DatabaseSession for PostgresSession {
     }
 }
 
+/// Sends `pg_cancel_backend` when the caller cancels.
+///
+/// Dropping the guard normally stops the watcher; dropping it *because* of a
+/// cancellation lets the watcher finish so the server actually gets told.
+struct NativeCancelGuard {
+    handle: tokio::task::JoinHandle<()>,
+    cancellation: CancellationToken,
+}
+
+impl NativeCancelGuard {
+    fn spawn(pool: PgPool, cancellation: CancellationToken, backend_pid: i32) -> Self {
+        let watcher = cancellation.clone();
+        let handle = tokio::spawn(async move {
+            watcher.cancelled().await;
+            // Best effort: a failed cancel must not mask the client-side one.
+            let _ignored = sqlx::query("SELECT pg_cancel_backend($1)")
+                .bind(backend_pid)
+                .execute(&pool)
+                .await;
+        });
+        Self {
+            handle,
+            cancellation,
+        }
+    }
+}
+
+impl Drop for NativeCancelGuard {
+    fn drop(&mut self) {
+        if !self.cancellation.is_cancelled() {
+            self.handle.abort();
+        }
+    }
+}
+
 async fn controlled<T, F>(
     deadline: Instant,
     cancellation: &CancellationToken,
@@ -1138,62 +1183,12 @@ fn bind_postgres_query<'a>(
     Ok(query)
 }
 
-struct TextBatchBuilder {
-    schema: SchemaRef,
-    columns: Vec<Vec<Option<String>>>,
-}
-
-impl TextBatchBuilder {
-    fn from_columns(columns: &[PgColumn]) -> Self {
-        let fields = columns
-            .iter()
-            .map(|column| {
-                let mut metadata = HashMap::new();
-                metadata.insert(
-                    "dbc.database_type".to_owned(),
-                    column.type_info().name().to_owned(),
-                );
-                Field::new(column.name(), DataType::Utf8, true).with_metadata(metadata)
-            })
-            .collect::<Vec<_>>();
-
-        Self {
-            schema: Arc::new(Schema::new(fields)),
-            columns: (0..columns.len()).map(|_| Vec::new()).collect(),
-        }
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn push(&mut self, row: &PgRow) -> Result<(), DriverError> {
-        for (index, values) in self.columns.iter_mut().enumerate() {
-            values.push(decode_cell(row, index)?);
-        }
-        Ok(())
-    }
-
-    fn len(&self) -> usize {
-        self.columns.first().map_or(0, Vec::len)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    fn finish(mut self) -> Result<RecordBatch, DriverError> {
-        let arrays = self
-            .columns
-            .iter_mut()
-            .map(|values| {
-                Arc::new(StringArray::from(mem::take(values))) as ArrayRef
-            })
-            .collect::<Vec<_>>();
-        RecordBatch::try_new(self.schema, arrays).map_err(|_| {
-            DriverError::Internal("could not build PostgreSQL result batch".to_owned())
-        })
-    }
+/// Project driver column metadata onto the shared result schema.
+fn column_schema(columns: &[PgColumn]) -> Arc<[ColumnSchema]> {
+    columns
+        .iter()
+        .map(|column| ColumnSchema::new(column.name(), column.type_info().name()))
+        .collect()
 }
 
 fn decode_cell(row: &PgRow, index: usize) -> Result<Option<String>, DriverError> {
@@ -1309,7 +1304,7 @@ fn map_connect_error(error: SqlxError) -> DriverError {
         SqlxError::Configuration(_) => {
             DriverError::Connection("PostgreSQL connection settings are invalid".to_owned())
         }
-        _ => DriverError::Connection("could not establish the PostgreSQL connection".to_owned()),
+        error => DriverError::Connection(format!("could not establish the PostgreSQL connection: {error}")),
     }
 }
 
@@ -1326,7 +1321,7 @@ fn map_query_error(error: SqlxError) -> DriverError {
         SqlxError::PoolClosed => {
             DriverError::Connection("PostgreSQL connection pool is closed".to_owned())
         }
-        _ => DriverError::Internal("PostgreSQL query execution failed".to_owned()),
+        error => DriverError::Internal(format!("PostgreSQL query execution failed: {error}")),
     }
 }
 

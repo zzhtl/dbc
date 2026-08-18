@@ -6,7 +6,7 @@ use dbc_core::{
         TableRef, TableStatementKind,
     },
 };
-use dbc_data::CellValue;
+use dbc_core::result::CellValue;
 use sqlparser::{
     ast::{GroupByExpr, SetExpr, Statement},
     dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
@@ -611,7 +611,7 @@ mod tests {
         FilterOperator, TableBrowseRequest, TableChangeRequest, TableColumn, TableFilter,
         TableInsert, TableKind, TableMetadata, TableRef, TableUpdate, UniqueKey,
     };
-    use dbc_data::CellValue;
+    use dbc_core::result::CellValue;
     use uuid::Uuid;
 
     use super::build_browse_plan;

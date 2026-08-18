@@ -8,7 +8,7 @@ use dbc_core::{
     metadata::{DatabaseObjectKind, ObjectListRequest},
     query::QueryRequest,
 };
-use dbc_data::DataBatch;
+use dbc_core::result::DataBatch;
 use dbc_drivers::RedisFactory;
 use futures_util::TryStreamExt;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +18,9 @@ use uuid::Uuid;
 #[ignore = "requires DBC_TEST_REDIS_URL"]
 async fn redis_vertical_contract() -> Result<(), Box<dyn std::error::Error>> {
     let Ok(endpoint) = env::var("DBC_TEST_REDIS_URL") else {
+        // Running with `--ignored` but no environment used to report a green
+        // pass while testing nothing at all.
+        eprintln!("skipped: DBC_TEST_REDIS_URL is not set");
         return Ok(());
     };
     let factory = RedisFactory::new();

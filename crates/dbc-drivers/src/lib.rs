@@ -48,109 +48,128 @@ pub fn builtin_descriptors() -> Vec<DriverDescriptor> {
     ]
 }
 
-fn postgres_descriptor() -> DriverDescriptor {
-    descriptor(
-        "postgresql",
-        "PostgreSQL",
-        QueryLanguage::Sql,
-        transactional_crud(),
-        Some(full_explain()),
-        Some(configurable_slow_queries()),
-        true,
-    )
-}
-
-fn mysql_descriptor() -> DriverDescriptor {
-    descriptor(
-        "mysql",
-        "MySQL / MariaDB",
-        QueryLanguage::Sql,
-        transactional_crud(),
-        Some(full_explain()),
-        Some(configurable_slow_queries()),
-        true,
-    )
-}
-
-fn mongo_descriptor() -> DriverDescriptor {
-    descriptor(
-        "mongodb",
-        "MongoDB",
-        QueryLanguage::MongoQuery,
-        transactional_crud(),
-        Some(full_explain()),
-        Some(SlowQueryCapabilities {
-            available: true,
-            configurable: true,
-        }),
-        false,
-    )
-}
-
-fn sqlite_descriptor() -> DriverDescriptor {
-    descriptor(
-        "sqlite",
-        "SQLite",
-        QueryLanguage::Sql,
-        transactional_crud(),
-        Some(ExplainCapabilities {
-            estimated: true,
-            analyzed: false,
-        }),
-        None,
-        true,
-    )
-}
-
-fn redis_descriptor() -> DriverDescriptor {
-    descriptor(
-        "redis",
-        "Redis / Valkey",
-        QueryLanguage::RedisCommand,
-        CrudCapabilities {
-            create: true,
-            update: true,
-            delete: true,
-            transactional: false,
-        },
-        None,
-        Some(SlowQueryCapabilities {
-            available: true,
-            configurable: false,
-        }),
-        false,
-    )
-}
-
-fn descriptor(
-    id: &str,
-    display_name: &str,
+/// What one driver actually implements.
+///
+/// Capabilities are never declared optimistically: `server_side_cancel` is set
+/// only for drivers that tell the database to stop the statement, and the
+/// schema-management, backup and import/export flags were dropped outright
+/// because nothing implemented them.
+struct DriverProfile {
+    id: &'static str,
+    display_name: &'static str,
     language: QueryLanguage,
     crud: CrudCapabilities,
     explain: Option<ExplainCapabilities>,
     slow_queries: Option<SlowQueryCapabilities>,
     table_data: bool,
-) -> DriverDescriptor {
+    server_side_cancel: bool,
+}
+
+fn postgres_descriptor() -> DriverDescriptor {
+    descriptor(DriverProfile {
+        id: "postgresql",
+        display_name: "PostgreSQL",
+        language: QueryLanguage::Sql,
+        crud: transactional_crud(),
+        explain: Some(full_explain()),
+        slow_queries: Some(configurable_slow_queries()),
+        table_data: true,
+        // `pg_cancel_backend` stops the statement on the server.
+        server_side_cancel: true,
+    })
+}
+
+fn mysql_descriptor() -> DriverDescriptor {
+    descriptor(DriverProfile {
+        id: "mysql",
+        display_name: "MySQL / MariaDB",
+        language: QueryLanguage::Sql,
+        crud: transactional_crud(),
+        explain: Some(full_explain()),
+        slow_queries: Some(configurable_slow_queries()),
+        table_data: true,
+        // `KILL QUERY` stops the statement on the server.
+        server_side_cancel: true,
+    })
+}
+
+fn mongo_descriptor() -> DriverDescriptor {
+    descriptor(DriverProfile {
+        id: "mongodb",
+        display_name: "MongoDB",
+        language: QueryLanguage::MongoQuery,
+        crud: transactional_crud(),
+        explain: Some(full_explain()),
+        slow_queries: Some(SlowQueryCapabilities {
+            available: true,
+            configurable: true,
+        }),
+        table_data: false,
+        // Cancellation is client-side only: no cursor kill is issued.
+        server_side_cancel: false,
+    })
+}
+
+fn sqlite_descriptor() -> DriverDescriptor {
+    descriptor(DriverProfile {
+        id: "sqlite",
+        display_name: "SQLite",
+        language: QueryLanguage::Sql,
+        crud: transactional_crud(),
+        explain: Some(ExplainCapabilities {
+            estimated: true,
+            analyzed: false,
+        }),
+        slow_queries: None,
+        table_data: true,
+        // sqlx exposes no interrupt hook for the bundled SQLite engine.
+        server_side_cancel: false,
+    })
+}
+
+fn redis_descriptor() -> DriverDescriptor {
+    descriptor(DriverProfile {
+        id: "redis",
+        display_name: "Redis / Valkey",
+        language: QueryLanguage::RedisCommand,
+        crud: CrudCapabilities {
+            create: true,
+            update: true,
+            delete: true,
+            transactional: false,
+        },
+        explain: None,
+        slow_queries: Some(SlowQueryCapabilities {
+            available: true,
+            configurable: false,
+        }),
+        table_data: false,
+        // RESP is strictly request/response; an in-flight command cannot be
+        // cancelled.
+        server_side_cancel: false,
+    })
+}
+
+fn descriptor(profile: DriverProfile) -> DriverDescriptor {
     let mut capabilities = CapabilitySet::builder()
-        .query_language(language)
-        .enable(Capability::Crud(crud))
-        .enable(Capability::SchemaManagement)
-        .enable(Capability::Backup)
-        .enable(Capability::ImportExport)
-        .enable(Capability::Cancellation);
-    if let Some(explain) = explain {
+        .query_language(profile.language)
+        .enable(Capability::Crud(profile.crud));
+    if let Some(explain) = profile.explain {
         capabilities = capabilities.enable(Capability::Explain(explain));
     }
-    if let Some(slow_queries) = slow_queries {
+    if let Some(slow_queries) = profile.slow_queries {
         capabilities = capabilities.enable(Capability::SlowQueries(slow_queries));
     }
-    if table_data {
+    if profile.table_data {
         capabilities = capabilities.enable(Capability::TableData);
+    }
+    if profile.server_side_cancel {
+        capabilities = capabilities.enable(Capability::Cancellation);
     }
 
     DriverDescriptor {
-        id: id.to_owned(),
-        display_name: display_name.to_owned(),
+        id: profile.id.to_owned(),
+        display_name: profile.display_name.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         capabilities: capabilities.build(),
     }

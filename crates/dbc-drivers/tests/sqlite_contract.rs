@@ -1,6 +1,5 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use arrow_array::{Array, StringArray};
 use dbc_core::{
     capability::QueryLanguage,
     diagnostics::{ExplainMode, ExplainRequest},
@@ -13,7 +12,7 @@ use dbc_core::{
         TableSort, TableUpdate,
     },
 };
-use dbc_data::{CellValue, DataBatch, DataSchema};
+use dbc_core::result::{CellValue, DataBatch, DataSchema};
 use dbc_drivers::SqliteFactory;
 use futures_util::TryStreamExt;
 use tokio_util::sync::CancellationToken;
@@ -63,13 +62,8 @@ async fn sqlite_vertical_contract() -> Result<(), Box<dyn std::error::Error>> {
             _ => None,
         })
         .expect("SELECT should return rows");
-    assert_eq!(batch.num_rows(), 2);
-    let names = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("SQLite text should use Arrow UTF-8");
-    assert_eq!(names.value(0), "alpha");
+    assert_eq!(batch.row_count(), 2);
+    assert_eq!(batch.value(0, 1), Some("alpha"));
 
     let empty = execute_to_end(
         &session,
@@ -78,7 +72,7 @@ async fn sqlite_vertical_contract() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     assert!(empty.iter().any(|event| matches!(
         event,
-        QueryEvent::Schema(DataSchema::Tabular(schema)) if schema.fields().len() == 2
+        QueryEvent::Schema(DataSchema::Tabular(schema)) if schema.len() == 2
     )));
     assert!(!empty
         .iter()
@@ -334,12 +328,11 @@ async fn sqlite_editable_table_data_is_typed_atomic_and_conflict_safe(
             _ => None,
         })
         .expect("verification should return one row");
-    let notes = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("SQLite text should use Arrow UTF-8");
-    assert!(notes.is_null(0), "the transaction must roll back");
+    assert_eq!(
+        batch.value(0, 0),
+        None,
+        "the transaction must roll back"
+    );
 
     session.close().await?;
     Ok(())

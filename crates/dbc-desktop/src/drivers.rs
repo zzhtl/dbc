@@ -67,7 +67,7 @@ pub const DRIVER_CHOICES: &[DriverChoice] = &[
         endpoint: "mongodb://127.0.0.1:27017",
         database: "test",
         user: "",
-        query: "{\n  \"operation\": \"find\",\n  \"collection\": \"items\",\n  \"filter\": {},\n  \"limit\": 100\n}",
+        query: "db.items.find({}).limit(100)",
         language: QueryLanguage::MongoQuery,
         editor_syntax: EditorSyntax::Json,
     },

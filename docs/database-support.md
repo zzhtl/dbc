@@ -12,26 +12,31 @@ CRUD 指通过查询编辑器执行数据库原生的创建、读取、更新和
 
 ## 内置驱动
 
-| 数据库 | 查询方式 | CRUD | 对象树 | 表数据 | Estimated | Analyze | 慢查询 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| PostgreSQL | SQL | ✅ | ✅ | ✅ | ✅ | ✅ | ⚙️ `pg_stat_statements` |
-| MySQL 8 | SQL | ✅ | ✅ | ✅ | ✅ | ✅ | ⚙️ `performance_schema` |
-| MariaDB | MySQL 协议 / SQL | ◐ | ◐ | ◐ | ◐ | ◐ | ◐ |
-| SQLite | SQL | ✅ | ✅ | ✅ | ✅ | — | — |
-| MongoDB | JSON 操作信封 | ✅ | ✅ | — | ✅ | ✅ | ⚙️ 数据库 profiler |
-| Redis 7 | Redis 命令 | ✅ | ✅ `SCAN` | — | — | — | ⚙️ `SLOWLOG` |
-| Valkey | Redis / RESP 命令 | ◐ | ◐ `SCAN` | — | — | — | ◐ `SLOWLOG` |
+| 数据库 | 查询方式 | CRUD | 对象树 | 表数据 | Estimated | Analyze | 慢查询 | 原生取消 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| PostgreSQL | SQL | ✅ | ✅ | ✅ | ✅ | ✅ | ⚙️ `pg_stat_statements` | ✅ `pg_cancel_backend` |
+| MySQL 8 | SQL | ✅ | ✅ | ✅ | ✅ | ✅ | ⚙️ `performance_schema` | ✅ `KILL QUERY` |
+| MariaDB | MySQL 协议 / SQL | ◐ | ◐ | ◐ | ◐ | ◐ | ◐ | ◐ |
+| SQLite | SQL | ✅ | ✅ | ✅ | ✅ | — | — | — |
+| MongoDB | 类 shell 语法 | ✅ | ✅ | — | ✅ | ✅ | ⚙️ 数据库 profiler | — |
+| Redis 7 | Redis 命令 | ✅ | ✅ `SCAN` | — | — | — | ⚙️ `SLOWLOG` | — |
+| Valkey | Redis / RESP 命令 | ◐ | ◐ `SCAN` | — | — | — | ◐ `SLOWLOG` | — |
 
-为控制桌面端依赖和本地 `target/` 体积，内置范围限定为 PostgreSQL、MySQL / MariaDB、
-SQLite、MongoDB、Redis / Valkey 五类主流数据库；DuckDB、ClickHouse 不再随应用编译。
+「原生取消」指点「取消」后语句在**数据库侧**真正停止。标 — 的驱动只能停止客户端接收，
+服务端会把语句跑完；这些驱动因此不声明 `Capability::Cancellation`，界面不会暗示做不到的事。
+
+为控制依赖体积，内置范围限定为 PostgreSQL、MySQL / MariaDB、SQLite、MongoDB、
+Redis / Valkey 五类主流数据库；DuckDB、ClickHouse 不随应用编译。
 
 ### 已完成的真实契约验证
 
-- PostgreSQL 16
+CI 每次提交都会拉起容器并运行下列版本的契约测试，不再依赖开发者本地手工准备环境：
+
+- PostgreSQL 16（预加载 `pg_stat_statements`）
 - MySQL 8.4
-- MongoDB 7
-- Redis 7
-- SQLite（bundled）
+- MongoDB 7（`setProfilingLevel(2)`）
+- Redis 7（`slowlog-log-slower-than 0`）
+- SQLite（bundled，无需外部服务）
 
 MariaDB 与 MySQL、Valkey 与 Redis 分别共享协议入口，但在声明为完全验证前仍需要独立版本矩阵。
 
@@ -40,6 +45,8 @@ MariaDB 与 MySQL、Valkey 与 Redis 分别共享协议入口，但在声明为�
 ### PostgreSQL
 
 - 使用 SQLx PostgreSQL 驱动。
+- 查询固定在一条连接上并记录 `pg_backend_pid()`，取消时从独立连接发
+  `pg_cancel_backend`，语句在服务端真正停止。
 - 对象树覆盖 schema、表、视图、列、索引等对象。
 - 表数据读取使用服务端精确计数和分页；主键优先，否则选择全部列均非空的唯一索引。
 - 非二进制表数据由 PostgreSQL 转为规范文本显示，写回时通过目标列类型显式转换；`bytea`
@@ -50,6 +57,7 @@ MariaDB 与 MySQL、Valkey 与 Redis 分别共享协议入口，但在声明为�
 ### MySQL / MariaDB
 
 - 使用 SQLx MySQL 驱动和 MySQL URL。
+- 查询固定在一条连接上并记录 `CONNECTION_ID()`，取消时从独立连接发 `KILL QUERY`。
 - MySQL 8.4 已验证对象树、JSON 执行计划、Analyze 和
   `performance_schema.events_statements_summary_by_digest`。
 - 表数据编辑排除前缀唯一索引和函数索引，避免把不能唯一定位完整行的索引当作稳定键。
@@ -63,6 +71,7 @@ MariaDB 与 MySQL、Valkey 与 Redis 分别共享协议入口，但在声明为�
 - 表数据保留 SQLite 动态类型中的 `NULL`、文本和 BLOB；部分唯一索引与表达式唯一索引不作为
   稳定行标识。
 - SQLite 没有跨会话的原生慢查询统计源；Analyze 模式没有被虚假映射为 Estimated。
+- sqlx 未暴露 `sqlite3_interrupt`，因此取消只作用于客户端，不声明取消能力。
 
 ## 表数据编辑边界
 
@@ -80,14 +89,18 @@ MariaDB 与 MySQL、Valkey 与 Redis 分别共享协议入口，但在声明为�
 ### MongoDB
 
 - 使用官方异步 Rust 驱动。
-- 查询编辑器接受有类型的 JSON 操作信封，而不是解析 JavaScript shell 代码。
+- 查询编辑器接受 `db.<集合>.<方法>(...)` 的 shell 写法，支持链式 `.limit()`、`.skip()`、
+  `.sort()`。括号内的参数必须是合法 JSON：shell 的宽松 JSON（不带引号的键）会被明确
+  拒绝并说明原因，而不是猜测用户的意图。原有的 JSON 操作信封继续可用。
 - `find` 和 `aggregate` 支持执行计划；Analyze 对应 `executionStats`。
 - 慢查询读取目标数据库的 `system.profile`，需要预先启用 profiler 并授予读取权限。
+- 当前未实现游标 kill，取消只作用于客户端，因此不声明取消能力。
 
 ### Redis / Valkey
 
 - 使用 `redis-rs` 的异步复用连接，仅启用 Tokio 和 Rustls TLS 所需特性；不依赖 OpenSSL，
   也不启用连接管理器、集群、脚本和大整数等默认功能。
+- RESP 是严格的请求/响应协议，在途命令无法取消，因此不声明取消能力。
 - 支持 `redis://`、`rediss://`、`valkey://`、`valkeys://`，查询编辑器接受 Redis 原生命令。
 - 对象树使用可分页的 `SCAN`，并批量读取 `TYPE` / `PTTL`；为避免阻塞服务端，查询入口拒绝
   `KEYS`。
@@ -112,6 +125,6 @@ MariaDB 与 MySQL、Valkey 与 Redis 分别共享协议入口，但在声明为�
 | C：云数仓 | Snowflake、BigQuery、Redshift | 独立插件 | OAuth、费用提示、异步作业、结果分页 |
 | C：时序/云 KV | InfluxDB、DynamoDB | 独立插件 | 专用查询语言、分页、容量/费用诊断 |
 
-只有“连接 + CRUD + 对象发现 + 取消/超时 + 能力准确声明 + 真实契约测试”全部满足后，
+只有"连接 + CRUD + 对象发现 + 取消/超时 + 能力准确声明 + 真实契约测试"全部满足后，
 数据库才应从路线图移入内置支持矩阵。无法提供执行计划或慢查询的数据库必须声明为不支持，
 而不是模拟一个含义不同的结果。

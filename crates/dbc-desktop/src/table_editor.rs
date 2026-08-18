@@ -7,7 +7,7 @@ use dbc_core::{
         TablePage, TableUpdate,
     },
 };
-use dbc_data::CellValue;
+use dbc_core::result::CellValue;
 use eframe::egui;
 use uuid::Uuid;
 
@@ -682,7 +682,7 @@ mod tests {
     use dbc_core::table_data::{
         TableColumn, TableKind, TableMetadata, TablePage, TableRef, UniqueKey,
     };
-    use dbc_data::CellValue;
+    use dbc_core::result::CellValue;
     use uuid::Uuid;
 
     use super::TableEditorState;

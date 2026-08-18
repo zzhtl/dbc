@@ -1,9 +1,5 @@
-use arrow_array::{
-    Array, BinaryArray, BooleanArray, Float64Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, RecordBatch, StringArray, UInt64Array,
-};
 use dbc_core::diagnostics::SlowQueryPage;
-use dbc_data::{CellValue, DataBatch, DataSchema};
+use dbc_core::result::{CellValue, DataBatch, DataSchema, RowBatch};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
@@ -164,8 +160,25 @@ impl ResultGridState {
                                     let value = self.model.rows[row_index]
                                         .get(column_index)
                                         .map_or("", String::as_str);
-                                    ui.add(egui::Label::new(value).selectable(true).truncate())
+                                    let response = ui
+                                        .add(
+                                            egui::Label::new(value)
+                                                .selectable(true)
+                                                .truncate()
+                                                .sense(egui::Sense::click()),
+                                        )
                                         .on_hover_text(value);
+                                    response.context_menu(|ui| {
+                                        if let Some(copied) = self.cell_menu(
+                                            ui,
+                                            row_index,
+                                            column_index,
+                                            &order,
+                                        ) {
+                                            ui.ctx().copy_text(copied);
+                                            ui.close();
+                                        }
+                                    });
                                 });
                             }
                         });
@@ -175,6 +188,99 @@ impl ResultGridState {
         if let Some((source, target)) = pending_move {
             self.move_column(source, target);
         }
+    }
+
+    /// Copy actions for one cell. Returns the text to put on the clipboard.
+    ///
+    /// The grid previously offered no way to get data out except a hover
+    /// tooltip, so anything longer than the column width was unreachable.
+    fn cell_menu(
+        &self,
+        ui: &mut egui::Ui,
+        row_index: usize,
+        column_index: usize,
+        order: &[usize],
+    ) -> Option<String> {
+        let cell = |row: usize, column: usize| -> &str {
+            self.model
+                .rows
+                .get(row)
+                .and_then(|values| values.get(column))
+                .map_or("", String::as_str)
+        };
+        if ui.button("复制单元格").clicked() {
+            return Some(cell(row_index, column_index).to_owned());
+        }
+        if ui.button("复制整行").clicked() {
+            return Some(
+                order
+                    .iter()
+                    .map(|&column| cell(row_index, column))
+                    .collect::<Vec<_>>()
+                    .join("\t"),
+            );
+        }
+        if ui.button("复制整列").clicked() {
+            return Some(
+                (0..self.model.rows.len())
+                    .map(|row| cell(row, column_index))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        ui.separator();
+        if ui.button("复制本页为 CSV").clicked() {
+            return Some(self.page_as_csv(order));
+        }
+        if ui.button("复制本页为 JSON").clicked() {
+            return Some(self.page_as_json(order));
+        }
+        None
+    }
+
+    fn page_as_csv(&self, order: &[usize]) -> String {
+        let mut out = String::new();
+        let header = order
+            .iter()
+            .map(|&column| csv_field(&self.model.columns[column]))
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push_str(&header);
+        out.push('\n');
+        for values in &self.model.rows {
+            let line = order
+                .iter()
+                .map(|&column| {
+                    csv_field(values.get(column).map_or("", String::as_str))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out
+    }
+
+    fn page_as_json(&self, order: &[usize]) -> String {
+        let rows = self
+            .model
+            .rows
+            .iter()
+            .map(|values| {
+                order
+                    .iter()
+                    .map(|&column| {
+                        (
+                            self.model.columns[column].clone(),
+                            serde_json::Value::from(
+                                values.get(column).map_or("", String::as_str),
+                            ),
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>()
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string_pretty(&rows).unwrap_or_default()
     }
 
     fn move_column(&mut self, source: usize, target: usize) {
@@ -208,21 +314,21 @@ pub(crate) fn tabular_cells(
         return None;
     };
     let columns = schema
-        .fields()
         .iter()
-        .map(|field| field.name().clone())
+        .map(|column| column.name.clone())
         .collect::<Vec<_>>();
     let mut rows = Vec::new();
     for batch in batches {
         let DataBatch::Tabular(batch) = batch else {
             return None;
         };
-        for row_index in 0..batch.num_rows() {
+        for row in 0..batch.row_count() {
             rows.push(
-                batch
-                    .columns()
-                    .iter()
-                    .map(|array| array_cell_value(array.as_ref(), row_index))
+                (0..batch.column_count())
+                    .map(|column| match batch.value(row, column) {
+                        Some(text) => CellValue::Text(text.to_owned()),
+                        None => CellValue::Null,
+                    })
                     .collect(),
             );
         }
@@ -232,7 +338,7 @@ pub(crate) fn tabular_cells(
 
 fn append_batch(model: &mut ResultModel, batch: &DataBatch) {
     match batch {
-        DataBatch::Tabular(batch) => append_record_batch(model, batch),
+        DataBatch::Tabular(batch) => append_row_batch(model, batch),
         DataBatch::Documents(documents) => {
             ensure_columns(model, &["文档"]);
             model.rows.extend(documents.iter().map(|document| {
@@ -259,65 +365,24 @@ fn append_batch(model: &mut ResultModel, batch: &DataBatch) {
     }
 }
 
-fn append_record_batch(model: &mut ResultModel, batch: &RecordBatch) {
+fn append_row_batch(model: &mut ResultModel, batch: &RowBatch) {
     if model.columns.is_empty() {
         model.columns = batch
             .schema()
-            .fields()
             .iter()
-            .map(|field| field.name().clone())
+            .map(|column| column.name.clone())
             .collect();
     }
-    for row_index in 0..batch.num_rows() {
+    for row in 0..batch.row_count() {
         model.rows.push(
-            batch
-                .columns()
-                .iter()
-                .map(|array| truncate_display(array_value(array.as_ref(), row_index)))
+            (0..batch.column_count())
+                .map(|column| match batch.value(row, column) {
+                    Some(text) => truncate_display(text.to_owned()),
+                    None => "NULL".to_owned(),
+                })
                 .collect(),
         );
     }
-}
-
-fn array_value(array: &dyn Array, row_index: usize) -> String {
-    if array.is_null(row_index) {
-        return "NULL".to_owned();
-    }
-    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-        return array.value(row_index).to_owned();
-    }
-    if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
-        return array.value(row_index).to_string();
-    }
-    if let Some(array) = array.as_any().downcast_ref::<UInt64Array>() {
-        return array.value(row_index).to_string();
-    }
-    if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
-        return array.value(row_index).to_string();
-    }
-    if let Some(array) = array.as_any().downcast_ref::<BooleanArray>() {
-        return array.value(row_index).to_string();
-    }
-    format!("<{}>", array.data_type())
-}
-
-fn array_cell_value(array: &dyn Array, row_index: usize) -> CellValue {
-    if array.is_null(row_index) {
-        return CellValue::Null;
-    }
-    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-        return CellValue::Text(array.value(row_index).to_owned());
-    }
-    if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
-        return CellValue::Text(array.value(row_index).to_owned());
-    }
-    if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
-        return CellValue::Binary(array.value(row_index).to_vec());
-    }
-    if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
-        return CellValue::Binary(array.value(row_index).to_vec());
-    }
-    CellValue::Text(array_value(array, row_index))
 }
 
 fn append_message(model: &mut ResultModel, message: String) {
@@ -337,11 +402,9 @@ fn ensure_columns(model: &mut ResultModel, columns: &[&str]) {
 
 fn schema_columns(schema: &DataSchema) -> Vec<String> {
     match schema {
-        DataSchema::Tabular(schema) => schema
-            .fields()
-            .iter()
-            .map(|field| field.name().clone())
-            .collect(),
+        DataSchema::Tabular(schema) => {
+            schema.iter().map(|column| column.name.clone()).collect()
+        }
         DataSchema::Documents => vec!["文档".to_owned()],
         DataSchema::KeyValues => vec![
             "键".to_owned(),
@@ -349,6 +412,15 @@ fn schema_columns(schema: &DataSchema) -> Vec<String> {
             "类型".to_owned(),
             "TTL(ms)".to_owned(),
         ],
+    }
+}
+
+/// Quote a CSV field per RFC 4180 when it carries a delimiter, quote or newline.
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
     }
 }
 
@@ -369,13 +441,45 @@ fn truncate_display(mut value: String) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, BinaryArray, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
-    use dbc_data::{CellValue, DataBatch, DataSchema};
+    use dbc_core::result::{
+        CellValue, ColumnSchema, DataBatch, DataSchema, RowBatchBuilder,
+    };
 
     use super::{
         DISPLAY_CELL_MAX_BYTES, ResultGridState, ResultModel, tabular_cells, truncate_display,
     };
+
+    #[test]
+    fn csv_copy_quotes_delimiters_quotes_and_newlines() {
+        let grid = ResultGridState::new(ResultModel {
+            columns: vec!["id".to_owned(), "note".to_owned()],
+            rows: vec![
+                vec!["1".to_owned(), "a,b".to_owned()],
+                vec!["2".to_owned(), "say \"hi\"".to_owned()],
+                vec!["3".to_owned(), "line1\nline2".to_owned()],
+            ],
+        });
+
+        let csv = grid.page_as_csv(&[0, 1]);
+
+        assert_eq!(
+            csv,
+            "id,note\n1,\"a,b\"\n2,\"say \"\"hi\"\"\"\n3,\"line1\nline2\"\n"
+        );
+    }
+
+    #[test]
+    fn json_copy_uses_the_displayed_column_order() {
+        let grid = ResultGridState::new(ResultModel {
+            columns: vec!["id".to_owned(), "name".to_owned()],
+            rows: vec![vec!["1".to_owned(), "alpha".to_owned()]],
+        });
+
+        let json = grid.page_as_json(&[1, 0]);
+
+        assert!(json.contains("\"name\": \"alpha\""));
+        assert!(json.contains("\"id\": \"1\""));
+    }
 
     #[test]
     fn display_truncation_preserves_utf8_boundaries() {
@@ -406,30 +510,28 @@ mod tests {
     }
 
     #[test]
-    fn editable_cells_preserve_null_text_and_binary_distinctions() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("text", DataType::Utf8, true),
-            Field::new("payload", DataType::Binary, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec![Some("NULL"), None])) as ArrayRef,
-                Arc::new(BinaryArray::from(vec![
-                    Some(&[0_u8, 255_u8][..]),
-                    None,
-                ])) as ArrayRef,
-            ],
-        )
-        .expect("record batch should build");
-        let data = DataBatch::Tabular(batch);
+    fn editable_cells_preserve_null_and_text_distinctions() {
+        let schema: Arc<[ColumnSchema]> = vec![
+            ColumnSchema::new("text", "text"),
+            ColumnSchema::new("payload", "bytea"),
+        ]
+        .into();
+        let mut builder = RowBatchBuilder::new(schema, 2);
+        for row in [[Some("NULL"), Some("\\x00ff")], [None, None]] {
+            builder
+                .push_row(|index| Ok::<_, ()>(row[index].map(str::to_owned)))
+                .expect("fixture rows should decode");
+        }
+        let data = DataBatch::Tabular(builder.take_batch());
         let schema = DataSchema::from_batch(&data);
 
-        let (_, rows) = tabular_cells(Some(&schema), &[data])
+        let (columns, rows) = tabular_cells(Some(&schema), &[data])
             .expect("tabular cells should be available");
+
+        assert_eq!(columns, vec!["text".to_owned(), "payload".to_owned()]);
         assert_eq!(rows[0][0], CellValue::Text("NULL".to_owned()));
+        assert_eq!(rows[0][1], CellValue::Text("\\x00ff".to_owned()));
         assert_eq!(rows[1][0], CellValue::Null);
-        assert_eq!(rows[0][1], CellValue::Binary(vec![0, 255]));
         assert_eq!(rows[1][1], CellValue::Null);
     }
 }

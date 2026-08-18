@@ -20,7 +20,7 @@ use dbc_core::{
     },
     query::QueryRequest,
 };
-use dbc_data::{DataBatch, DataSchema};
+use dbc_core::result::{DataBatch, DataSchema};
 use redis::{
     Client, ErrorKind, IntoConnectionInfo, RedisError, Value,
     aio::MultiplexedConnection,

@@ -8,7 +8,7 @@ use dbc_core::{
         TableRef, UniqueKey,
     },
 };
-use dbc_data::CellValue;
+use dbc_core::result::CellValue;
 use uuid::Uuid;
 
 fn users_metadata() -> TableMetadata {

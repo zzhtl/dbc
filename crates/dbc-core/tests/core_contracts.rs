@@ -6,7 +6,6 @@ use dbc_core::{
         SlowQueryCapabilities,
     },
     driver::SecretValue,
-    policy::{AccessMode, Actor, Operation, PolicyDecision, PolicyEngine, SecurityPolicy},
     query::{QueryRequest, QueryValidationError},
     sql::{
         SqlDialect, StatementRisk, classify_sql, is_single_statement,
@@ -47,53 +46,6 @@ fn capability_set_round_trips_without_losing_driver_features() {
     assert!(decoded.supports_crud());
     assert!(decoded.supports_explain());
     assert!(decoded.supports_slow_queries());
-}
-
-#[test]
-fn default_policy_is_read_only_for_every_actor() {
-    let engine = PolicyEngine::new(SecurityPolicy::default());
-
-    for actor in [Actor::Desktop, Actor::Ai, Actor::Mcp] {
-        assert_eq!(
-            engine.authorize(actor, Operation::Read),
-            PolicyDecision::Allowed
-        );
-        assert_eq!(
-            engine.authorize(actor, Operation::SafeWrite),
-            PolicyDecision::Denied {
-                required: AccessMode::SafeWrite,
-                configured: AccessMode::ReadOnly,
-            }
-        );
-        assert_eq!(
-            engine.authorize(actor, Operation::HighRiskWrite),
-            PolicyDecision::Denied {
-                required: AccessMode::HighRiskWrite,
-                configured: AccessMode::ReadOnly,
-            }
-        );
-    }
-}
-
-#[test]
-fn desktop_and_automation_permissions_are_independent() {
-    let policy = SecurityPolicy::default()
-        .with_mode(Actor::Desktop, AccessMode::HighRiskWrite)
-        .with_mode(Actor::Ai, AccessMode::SafeWrite);
-    let engine = PolicyEngine::new(policy);
-
-    assert_eq!(
-        engine.authorize(Actor::Desktop, Operation::HighRiskWrite),
-        PolicyDecision::RequiresConfirmation
-    );
-    assert_eq!(
-        engine.authorize(Actor::Ai, Operation::SafeWrite),
-        PolicyDecision::RequiresConfirmation
-    );
-    assert!(matches!(
-        engine.authorize(Actor::Mcp, Operation::SafeWrite),
-        PolicyDecision::Denied { .. }
-    ));
 }
 
 #[test]

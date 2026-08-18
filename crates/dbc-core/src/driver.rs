@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, fmt, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
-use dbc_data::{DataBatch, DataSchema};
+use crate::result::{DataBatch, DataSchema};
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

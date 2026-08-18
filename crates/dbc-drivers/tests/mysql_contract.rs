@@ -1,6 +1,5 @@
 use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
 
-use arrow_array::StringArray;
 use dbc_core::{
     capability::QueryLanguage,
     diagnostics::{ExplainMode, ExplainRequest, SlowQueryOrder, SlowQueryRequest},
@@ -14,7 +13,7 @@ use dbc_core::{
         SortDirection, TableBrowseRequest, TableChangeRequest, TableRef, TableSort, TableUpdate,
     },
 };
-use dbc_data::{CellValue, DataBatch};
+use dbc_core::result::{CellValue, DataBatch};
 use dbc_drivers::MySqlFactory;
 use futures_util::TryStreamExt;
 use tokio_util::sync::CancellationToken;
@@ -24,9 +23,15 @@ use uuid::Uuid;
 #[ignore = "requires DBC_TEST_MYSQL_URL and DBC_TEST_MYSQL_PASSWORD"]
 async fn mysql_vertical_contract() -> Result<(), Box<dyn std::error::Error>> {
     let Ok(endpoint) = env::var("DBC_TEST_MYSQL_URL") else {
+        // Running with `--ignored` but no environment used to report a green
+        // pass while testing nothing at all.
+        eprintln!("skipped: DBC_TEST_MYSQL_URL is not set");
         return Ok(());
     };
     let Ok(password) = env::var("DBC_TEST_MYSQL_PASSWORD") else {
+        // Running with `--ignored` but no environment used to report a green
+        // pass while testing nothing at all.
+        eprintln!("skipped: DBC_TEST_MYSQL_PASSWORD is not set");
         return Ok(());
     };
     let user = env::var("DBC_TEST_MYSQL_USER").unwrap_or_else(|_| "root".to_owned());
@@ -86,14 +91,9 @@ VALUES
             _ => None,
         })
         .expect("SELECT should return a tabular batch");
-    assert_eq!(batch.num_rows(), 2);
-    let names = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("MySQL text columns should use Arrow UTF-8");
-    assert_eq!(names.value(0), "alpha");
-    assert_eq!(names.value(1), "beta");
+    assert_eq!(batch.row_count(), 2);
+    assert_eq!(batch.value(0, 1), Some("alpha"));
+    assert_eq!(batch.value(1, 1), Some("beta"));
 
     let table = TableRef::new([database.as_str()], "dbc_contract_items");
     let metadata = session
@@ -248,16 +248,37 @@ VALUES
         "performance_schema.events_statements_summary_by_digest"
     );
 
+    // The stream is lazy: cancelling before it is polled would never start the
+    // statement at all, so drive it on a task and only cancel once the server
+    // is provably running it.
     let cancellation = CancellationToken::new();
     let mut cancelled_stream = session
         .execute(query_request("SELECT SLEEP(10)"), cancellation.clone())
         .await?;
+    // The driver yields `Schema` right after preparing, before the statement
+    // runs, so the reader must consume past it for the query to actually start.
+    let reader = tokio::spawn(async move {
+        while cancelled_stream.try_next().await?.is_some() {}
+        Ok::<(), DriverError>(())
+    });
+    assert!(
+        wait_for_running_query(&session, "SLEEP(10)", true).await?,
+        "the long query should be visible as running before it is cancelled"
+    );
+
     cancellation.cancel();
-    let cancelled = cancelled_stream
-        .try_next()
+    let cancelled = reader
         .await
+        .expect("reader task should not panic")
         .expect_err("cancelled query should terminate with a typed error");
     assert!(matches!(cancelled, DriverError::Cancelled));
+
+    // A client-side cancellation is not enough: `KILL QUERY` must actually
+    // stop the statement, otherwise the server keeps working for nothing.
+    assert!(
+        wait_for_running_query(&session, "SLEEP(10)", false).await?,
+        "KILL QUERY should have stopped the statement server-side"
+    );
 
     session.close().await?;
     Ok(())
@@ -282,6 +303,45 @@ fn query_request(text: &str) -> QueryRequest {
         Duration::from_secs(5),
         1_000,
     )
+}
+
+/// Poll the process list until a statement matching `needle` is (or is no
+/// longer) running on another session.
+async fn wait_for_running_query(
+    session: &Arc<dyn DatabaseSession>,
+    needle: &str,
+    expect_running: bool,
+) -> Result<bool, DriverError> {
+    let sql = format!(
+        "SELECT COUNT(*) AS running FROM information_schema.PROCESSLIST \
+         WHERE ID <> CONNECTION_ID() AND INFO LIKE '%{needle}%' \
+           AND INFO NOT LIKE '%PROCESSLIST%'"
+    );
+    poll_running_count(session, &sql, expect_running).await
+}
+
+/// Run `sql` until its single count column reaches the expected state.
+async fn poll_running_count(
+    session: &Arc<dyn DatabaseSession>,
+    sql: &str,
+    expect_running: bool,
+) -> Result<bool, DriverError> {
+    for _ in 0..50 {
+        let events = execute_to_end(session, sql).await?;
+        let running = events
+            .iter()
+            .find_map(|event| match event {
+                QueryEvent::Rows(DataBatch::Tabular(batch)) => batch.value(0, 0),
+                _ => None,
+            })
+            .unwrap_or("0")
+            != "0";
+        if running == expect_running {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(false)
 }
 
 async fn execute_to_end(

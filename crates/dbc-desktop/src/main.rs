@@ -1,11 +1,23 @@
 mod app;
+mod atomic_file;
 mod drivers;
 mod export;
+mod file_picker;
+mod fonts;
+mod labels;
+mod paging;
+mod palette;
 mod result_table;
+mod shortcuts;
+mod status;
+mod store;
 mod table_editor;
+mod text_format;
+mod tasks;
+mod vault_prompt;
+mod write_guard;
 
 use eframe::egui;
-use egui_system_fonts::FontStyle;
 
 use crate::app::DbcApp;
 
@@ -15,7 +27,7 @@ fn main() -> eframe::Result {
             .with_app_id("dbc")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([960.0, 640.0]),
-        renderer: eframe::Renderer::Wgpu,
+        renderer: eframe::Renderer::Glow,
         centered: true,
         persist_window: false,
         ..eframe::NativeOptions::default()
@@ -25,8 +37,8 @@ fn main() -> eframe::Result {
         "DBC",
         native_options,
         Box::new(|creation_context| {
-            egui_system_fonts::add_auto(&creation_context.egui_ctx, FontStyle::Sans);
-            Ok(Box::new(DbcApp::new()?))
+            let font = fonts::install_cjk_font(&creation_context.egui_ctx);
+            Ok(Box::new(DbcApp::new(store::Store::open(), font.is_none())?))
         }),
     )
 }

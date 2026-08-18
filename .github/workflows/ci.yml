@@ -21,6 +21,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # No Vulkan packages: the application renders through glow (OpenGL), so it
+      # also runs on virtual machines, remote desktops and older GPUs.
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
@@ -29,8 +31,7 @@ jobs:
             fonts-noto-cjk \
             libfontconfig1-dev libfreetype6-dev \
             libwayland-dev libx11-dev libxcb1-dev libx11-xcb-dev \
-            libxkbcommon-dev \
-            libvulkan1 mesa-vulkan-drivers
+            libxkbcommon-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -46,6 +47,71 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --workspace
+
+  contract:
+    name: Real database contract tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Started with `docker run` rather than `services:` because the slow-query
+      # sources need server-side configuration that service containers cannot
+      # express: PostgreSQL must preload pg_stat_statements, MongoDB needs the
+      # profiler on, and Redis must log every command to SLOWLOG.
+      - name: Start databases
+        run: |
+          docker run -d --name dbc-pg \
+            -e POSTGRES_PASSWORD=dbcpass -e POSTGRES_DB=dbc_contract \
+            -p 55432:5432 postgres:16 -c shared_preload_libraries=pg_stat_statements
+          docker run -d --name dbc-mysql \
+            -e MYSQL_ROOT_PASSWORD=dbcpass -e MYSQL_DATABASE=dbc_contract \
+            -p 53306:3306 mysql:8.4
+          docker run -d --name dbc-redis -p 56379:6379 redis:7
+          docker run -d --name dbc-mongo -p 57017:27017 mongo:7
+
+      - name: Wait for databases and apply prerequisites
+        run: |
+          for _ in $(seq 1 60); do
+            docker exec dbc-pg pg_isready -U postgres >/dev/null 2>&1 \
+              && docker exec dbc-mysql mysqladmin ping -uroot -pdbcpass >/dev/null 2>&1 \
+              && docker exec dbc-redis redis-cli ping >/dev/null 2>&1 \
+              && docker exec dbc-mongo mongosh --quiet --eval 'db.runCommand({ping:1})' >/dev/null 2>&1 \
+              && break
+            sleep 3
+          done
+          docker exec dbc-pg psql -U postgres -d dbc_contract \
+            -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+          docker exec dbc-redis redis-cli CONFIG SET slowlog-log-slower-than 0
+          docker exec dbc-mongo mongosh --quiet dbc_contract --eval 'db.setProfilingLevel(2)'
+
+      - name: Run contract tests
+        env:
+          DBC_TEST_POSTGRES_URL: postgres://127.0.0.1:55432/dbc_contract
+          DBC_TEST_POSTGRES_USER: postgres
+          DBC_TEST_POSTGRES_PASSWORD: dbcpass
+          DBC_TEST_MYSQL_URL: mysql://127.0.0.1:53306/dbc_contract
+          DBC_TEST_MYSQL_USER: root
+          DBC_TEST_MYSQL_PASSWORD: dbcpass
+          DBC_TEST_MYSQL_DATABASE: dbc_contract
+          DBC_TEST_REDIS_URL: redis://127.0.0.1:56379
+          DBC_TEST_MONGODB_URL: mongodb://127.0.0.1:57017/dbc_contract
+        run: cargo test --locked -p dbc-drivers -- --include-ignored
 
   platform-check:
     name: Check ${{ matrix.os }}

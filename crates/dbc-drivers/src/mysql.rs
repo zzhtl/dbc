@@ -1,15 +1,12 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fmt::Display,
     future::Future,
-    mem,
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
@@ -39,7 +36,7 @@ use dbc_core::{
         TableStatementKind, UniqueKey,
     },
 };
-use dbc_data::{CellValue, DataBatch, DataSchema};
+use dbc_core::result::{CellValue, ColumnSchema, DataBatch, DataSchema, RowBatchBuilder};
 use futures_util::TryStreamExt;
 use sqlx::{
     AssertSqlSafe, Column, Decode, Either, Error as SqlxError, Executor, MySql, Row,
@@ -79,7 +76,7 @@ SELECT
     IS_NULLABLE = 'YES' AS nullable,
     ORDINAL_POSITION AS ordinal,
     COLUMN_DEFAULT AS default_expression,
-    EXTRA LIKE '%GENERATED%' AS generated,
+    EXTRA LIKE '%GENERATED%' AS `generated`,
     EXTRA LIKE '%auto_increment%' AS auto_increment
 FROM information_schema.COLUMNS
 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
@@ -337,15 +334,33 @@ impl DatabaseSession for MySqlSession {
             let started = Instant::now();
             let mut returned_rows = 0_u64;
             let mut affected_rows = 0_u64;
+            // Pin the query to one connection so a cancellation knows which
+            // session to kill; without this the request only stopped being read
+            // client-side and kept running to completion on the server.
+            let mut connection = controlled(deadline, &cancellation, pool.acquire())
+                .await?
+                .map_err(map_query_error)?;
+            let connection_id = controlled(
+                deadline,
+                &cancellation,
+                sqlx::query_scalar::<_, u64>("SELECT CONNECTION_ID()")
+                    .fetch_one(&mut *connection),
+            )
+            .await?
+            .map_err(map_query_error)?;
+            let _cancel_guard =
+                NativeCancelGuard::spawn(pool.clone(), cancellation.clone(), connection_id);
+
             let statement = controlled(
                 deadline,
                 &cancellation,
-                pool.prepare(AssertSqlSafe(text.as_str()).into_sql_str()),
+                connection.prepare(AssertSqlSafe(text.as_str()).into_sql_str()),
             )
             .await?
             .map_err(map_query_error)?;
             let returns_rows = !statement.columns().is_empty();
-            let mut batch = TextBatchBuilder::from_columns(statement.columns());
+            let mut batch =
+                RowBatchBuilder::new(column_schema(statement.columns()), QUERY_BATCH_ROWS);
             if returns_rows {
                 yield QueryEvent::Schema(DataSchema::Tabular(batch.schema()));
             }
@@ -353,7 +368,7 @@ impl DatabaseSession for MySqlSession {
 
             // Editor input reaches this boundary only after DBC policy evaluation.
             let mut results =
-                sqlx::raw_sql(AssertSqlSafe(text.as_str())).fetch_many(&pool);
+                sqlx::raw_sql(AssertSqlSafe(text.as_str())).fetch_many(&mut *connection);
             while returned_rows < usize_to_u64(row_limit) {
                 let next = controlled(deadline, &cancellation, results.try_next())
                     .await?
@@ -363,17 +378,12 @@ impl DatabaseSession for MySqlSession {
                 };
                 match result {
                     Either::Right(row) => {
-                        batch.push(&row)?;
+                        batch.push_row(|index| decode_cell(&row, index))?;
                         returned_rows = returned_rows.saturating_add(1);
                         if batch.len() >= QUERY_BATCH_ROWS
                             || returned_rows >= usize_to_u64(row_limit)
                         {
-                            let finished_batch = mem::replace(
-                                &mut batch,
-                                TextBatchBuilder::from_columns(row.columns()),
-                            )
-                            .finish()?;
-                            yield QueryEvent::Rows(DataBatch::Tabular(finished_batch));
+                            yield QueryEvent::Rows(DataBatch::Tabular(batch.take_batch()));
                         }
                     }
                     Either::Left(result) => {
@@ -386,7 +396,7 @@ impl DatabaseSession for MySqlSession {
                 }
             }
             if !batch.is_empty() {
-                yield QueryEvent::Rows(DataBatch::Tabular(batch.finish()?));
+                yield QueryEvent::Rows(DataBatch::Tabular(batch.take_batch()));
             }
 
             yield QueryEvent::Finished(QueryStats {
@@ -664,8 +674,15 @@ impl DatabaseSession for MySqlSession {
         )
         .await?
         .map_err(map_query_error)?
-        .try_get::<u64, _>(0)
-        .map_err(map_query_error)?;
+        // MySQL reports `COUNT(*)` through the binary protocol as signed
+        // BIGINT, so decoding it as `u64` fails the type check outright.
+        .try_get::<i64, _>(0)
+        .map_err(map_query_error)
+        .and_then(|count| {
+            u64::try_from(count).map_err(|_| {
+                DriverError::Internal("MySQL returned a negative row count".to_owned())
+            })
+        })?;
         let rows = controlled(
             deadline,
             &cancellation,
@@ -744,6 +761,42 @@ impl DatabaseSession for MySqlSession {
     async fn close(&self) -> Result<(), DriverError> {
         self.pool.close().await;
         Ok(())
+    }
+}
+
+/// Sends `KILL QUERY` when the caller cancels.
+///
+/// Dropping the guard normally stops the watcher; dropping it *because* of a
+/// cancellation lets the watcher finish so the server actually gets told.
+struct NativeCancelGuard {
+    handle: tokio::task::JoinHandle<()>,
+    cancellation: CancellationToken,
+}
+
+impl NativeCancelGuard {
+    fn spawn(pool: MySqlPool, cancellation: CancellationToken, connection_id: u64) -> Self {
+        let watcher = cancellation.clone();
+        let handle = tokio::spawn(async move {
+            watcher.cancelled().await;
+            // `KILL` takes no placeholders; the id is a `u64` this driver read
+            // back from the server, so formatting it cannot inject anything.
+            let statement = format!("KILL QUERY {connection_id}");
+            let _ignored = sqlx::raw_sql(AssertSqlSafe(statement.as_str()))
+                .execute(&pool)
+                .await;
+        });
+        Self {
+            handle,
+            cancellation,
+        }
+    }
+}
+
+impl Drop for NativeCancelGuard {
+    fn drop(&mut self) {
+        if !self.cancellation.is_cancelled() {
+            self.handle.abort();
+        }
     }
 }
 
@@ -1043,58 +1096,12 @@ fn bind_mysql_query<'a>(
     Ok(query)
 }
 
-struct TextBatchBuilder {
-    schema: SchemaRef,
-    columns: Vec<Vec<Option<String>>>,
-}
-
-impl TextBatchBuilder {
-    fn from_columns(columns: &[MySqlColumn]) -> Self {
-        let fields = columns
-            .iter()
-            .map(|column| {
-                let mut metadata = HashMap::new();
-                metadata.insert(
-                    "dbc.database_type".to_owned(),
-                    column.type_info().name().to_owned(),
-                );
-                Field::new(column.name(), DataType::Utf8, true).with_metadata(metadata)
-            })
-            .collect::<Vec<_>>();
-        Self {
-            schema: Arc::new(Schema::new(fields)),
-            columns: (0..columns.len()).map(|_| Vec::new()).collect(),
-        }
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn push(&mut self, row: &MySqlRow) -> Result<(), DriverError> {
-        for (index, values) in self.columns.iter_mut().enumerate() {
-            values.push(decode_cell(row, index)?);
-        }
-        Ok(())
-    }
-
-    fn len(&self) -> usize {
-        self.columns.first().map_or(0, Vec::len)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    fn finish(mut self) -> Result<RecordBatch, DriverError> {
-        let arrays = self
-            .columns
-            .iter_mut()
-            .map(|values| Arc::new(StringArray::from(mem::take(values))) as ArrayRef)
-            .collect::<Vec<_>>();
-        RecordBatch::try_new(self.schema, arrays)
-            .map_err(|_| DriverError::Internal("could not build MySQL result batch".to_owned()))
-    }
+/// Project driver column metadata onto the shared result schema.
+fn column_schema(columns: &[MySqlColumn]) -> Arc<[ColumnSchema]> {
+    columns
+        .iter()
+        .map(|column| ColumnSchema::new(column.name(), column.type_info().name()))
+        .collect()
 }
 
 fn decode_cell(row: &MySqlRow, index: usize) -> Result<Option<String>, DriverError> {
@@ -1198,7 +1205,7 @@ fn map_connect_error(error: SqlxError) -> DriverError {
         SqlxError::Configuration(_) => {
             DriverError::Connection("MySQL connection settings are invalid".to_owned())
         }
-        _ => DriverError::Connection("could not establish the MySQL connection".to_owned()),
+        error => DriverError::Connection(format!("could not establish the MySQL connection: {error}")),
     }
 }
 
@@ -1215,7 +1222,7 @@ fn map_query_error(error: SqlxError) -> DriverError {
         SqlxError::PoolClosed => {
             DriverError::Connection("MySQL connection pool is closed".to_owned())
         }
-        _ => DriverError::Internal("MySQL query execution failed".to_owned()),
+        error => DriverError::Internal(format!("MySQL query execution failed: {error}")),
     }
 }
 

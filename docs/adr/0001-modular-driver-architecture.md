@@ -37,63 +37,58 @@ DBC 需要在一个桌面客户端中支持主流关系型、文档型和键值�
 
 ### 2. 保留三类自然结果模型
 
-`dbc-data` 使用：
+`dbc-core::result` 使用：
 
-- Arrow `RecordBatch` 表示关系型/列式结果。
+- 列式 `RowBatch` 表示关系型结果（见 [ADR-0003](0003-self-contained-local-dependencies.md)）。
 - JSON 文档表示文档数据库结果。
 - 二进制安全的 key/value 记录表示键值数据库结果。
 
 所有模型都通过 `QueryEvent` 流传递。调用方还必须设置超时和行数上限，避免把完整远程
 数据集加载进桌面进程。
 
-### 3. 内置驱动原生运行，长尾驱动使用进程边界
+### 3. 所有驱动内置，不引入插件进程
 
-首批高频数据库作为 `dbc-drivers` 内置驱动，以获得较低延迟、类型安全和简单分发。
+五类数据库全部作为 `dbc-drivers` 内置驱动，以获得较低延迟、类型安全和单文件分发。
 
-长尾和第三方驱动采用独立进程协议：
-
-- Protobuf 控制消息负责握手、连接、查询、对象树、执行计划、慢查询、取消和关闭。
-- Arrow IPC、JSON 文档和 key/value frame 负责数据传输。
-- 协议使用主/次版本协商；主版本不兼容时拒绝加载。
-- header 和 payload 在分配前检查大小。
-
-当前版本已经实现协议 v1.1 和 frame codec；插件发现、进程监管、签名/信任和 Host 到
-`DatabaseSession` 的适配器在后续里程碑实现。在 Host 完成前，不把外部插件标记为可用功能。
+本 ADR 的初版还规划了一套 Protobuf 进程插件协议来承载长尾数据库。该协议的消息定义和
+frame codec 曾经实现过，但插件发现、进程监管、信任策略和 Host 适配器始终没有落地，
+整个 crate 没有被任何生产代码引用。它已被删除：一套没有 Host 的协议只是编译负担和
+误导性的文档承诺。扩展新数据库时继续新增内置驱动；只有当"不可信的第三方驱动"成为真实
+需求时，才重新引入进程边界。
 
 ### 4. 驱动任务与 egui UI 线程分离
 
-`dbc-runtime` 持有独立 Tokio runtime 和全局 semaphore。每个任务获得
+`dbc-desktop::tasks` 持有独立 Tokio runtime 和全局 semaphore。每个任务获得
 `CancellationToken`，取消、操作失败和 join 失败保持为不同错误。
 
 驱动不能在 egui UI 线程上直接执行数据库操作。运行时通过完成事件和有界查询事件通道
 把结果交给 eframe 的 `App::logic`，后台发送事件后调用 `request_repaint` 唤醒界面。
-未来插件若使用同步数据库 API，必须进入阻塞工作线程。驱动应尽可能调用数据库原生取消机制。
+同步的数据库 API 必须进入阻塞工作线程。
+
+驱动应尽可能调用数据库原生取消机制，并且**只有真正做到的驱动才允许声明
+`Capability::Cancellation`**。PostgreSQL 使用 `pg_cancel_backend`、MySQL 使用
+`KILL QUERY`，两者都把查询固定在一条连接上以便定位要取消的会话；SQLite、MongoDB 和
+Redis 只能停止客户端接收，因此不声明该能力。
 
 ### 5. 安全边界
 
 - 连接 profile 只保存 `secret_id`，凭据由独立 `SecretValue` 传入并在释放时清零。
-- 桌面首版密码只驻留内存；后续持久化必须使用 `dbc-storage` 的操作系统密钥环。
+- 密码要么只驻留内存，要么存进应用自带的加密凭据库（Argon2id + ChaCha20-Poly1305），
+  不依赖操作系统密钥环，见 [ADR-0003](0003-self-contained-local-dependencies.md)。
 - 日志和 `Debug` 输出必须脱敏。
 - SQL、MongoDB 和 Redis / Valkey 写操作由客户端风险分类并二次确认。
-- 插件进程默认不视为可信；Host 需要显式信任策略、最小环境变量和生命周期限制。
+- 驱动声明的能力必须与实现一致；宁可少声明，也不能让界面暴露不存在的入口。
 
 ## 高层结构
 
 ```mermaid
 flowchart TB
-    EGUI["dbc-desktop<br/>egui/eframe"] --> Contract["dbc-core contracts"]
-    EGUI --> Runtime["dbc-runtime"]
-    Contract --> Data["dbc-data"]
-    Contract --> Native["dbc-drivers"]
+    EGUI["dbc-desktop<br/>egui · tasks · store"] --> Contract["dbc-core 契约与结果类型"]
+    EGUI --> Native["dbc-drivers"]
+    Native --> Contract
     Native --> Sql[("PostgreSQL / MySQL / SQLite")]
     Native --> Document[("MongoDB")]
     Native --> KeyValue[("Redis / Valkey")]
-
-    FutureHost["Process Driver Host（后续）"] --> Contract
-    FutureHost --> Codec["dbc-plugin-protocol"]
-    Codec <--> Plugin["外部驱动进程"]
-
-    Metadata["dbc-storage"] --> Contract
 ```
 
 ## 失败模式与应对
@@ -150,13 +145,13 @@ flowchart TB
 
 ### 使用 Web UI / Electron / Tauri
 
-当前未采用。egui/eframe 通过 WGPU 提供 Linux、macOS、Windows 原生 GPU 渲染和
-Rust 内状态模型，适合虚拟表格及低延迟桌面交互。如果未来某个复杂可视化在 egui 中
-成本过高，可以只在该面板使用 WebView，而不替换整个应用架构。
+当前未采用。egui/eframe 通过 glow（OpenGL）提供 Linux、macOS、Windows 原生渲染和
+Rust 内状态模型，适合虚拟表格及低延迟桌面交互，且对运行环境没有 Vulkan 之类的硬性
+要求。如果未来某个复杂可视化在 egui 中成本过高，可以只在该面板使用 WebView，而不替换
+整个应用架构。
 
 ## 参考
 
 - [数据库支持矩阵](../database-support.md)
-- [插件协议](../../proto/driver/v1/driver.proto)
+- [ADR-0003：自研本地依赖与结果表示](0003-self-contained-local-dependencies.md)
 - [egui](https://github.com/emilk/egui)
-- [DBX 参考项目](https://github.com/t8y2/dbx)

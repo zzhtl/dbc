@@ -42,9 +42,7 @@ pub enum Capability {
     Explain(ExplainCapabilities),
     SlowQueries(SlowQueryCapabilities),
     TableData,
-    SchemaManagement,
-    Backup,
-    ImportExport,
+    /// The driver stops a running statement on the server, not just client-side.
     Cancellation,
 }
 

@@ -1,10 +1,6 @@
 [workspace]
 members = [
     "crates/dbc-core",
-    "crates/dbc-data",
-    "crates/dbc-runtime",
-    "crates/dbc-storage",
-    "crates/dbc-plugin-protocol",
     "crates/dbc-drivers",
     "crates/dbc-desktop",
 ]
@@ -20,27 +16,24 @@ publish = false
 anyhow = "1.0.100"
 async-trait = "0.1.89"
 async-stream = "0.3.6"
-arrow-array = "58.4.0"
-arrow-schema = { version = "58.4.0", features = ["serde"] }
 bigdecimal = "0.4.10"
-base64 = "0.22.1"
-bytes = "1.11.1"
 chrono = { version = "0.4.44", default-features = false, features = ["std"] }
-csv = "1.4.0"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
-eframe = "0.35.0"
+# glow(OpenGL) 而非默认的 wgpu：去掉 Linux 上的 Vulkan 驱动要求，
+# 虚拟机、远程桌面和老显卡都能直接跑。accesskit 供 egui_kittest 使用。
+eframe = { version = "0.35.0", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 egui_extras = "0.35.0"
 egui_code_editor = "0.3.7"
-egui-system-fonts = "0.35.0"
 egui_kittest = { version = "0.35.0", features = ["eframe"] }
-keyring = "4.1.5"
 mongodb = { version = "3.8.0", features = ["redact-errors"] }
-prost = "0.14.4"
 redis = { version = "=1.4.1", default-features = false, features = ["tokio-rustls-comp"] }
-rfd = "0.17.2"
-# Keep libsqlite3-sys compatible with SQLx 0.9's published dependency range.
-rusqlite = { version = "0.39.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 shell-words = "=1.1.1"
@@ -52,6 +45,13 @@ tokio = { version = "1.49.0", features = ["rt-multi-thread", "sync", "time", "ma
 tokio-util = "0.7.18"
 uuid = { version = "1.20.0", features = ["serde", "v4"] }
 zeroize = "1.8.2"
+
+[profile.release]
+# The binary ships as one file; symbols are what made it large, not code.
+strip = "symbols"
+# Cross-crate inlining across the egui and sqlx layers, without the build-time
+# cost of fat LTO.
+lto = "thin"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

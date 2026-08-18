@@ -7,7 +7,6 @@ publish.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-dbc-data = { path = "../dbc-data" }
 futures-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

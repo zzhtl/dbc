@@ -85,3 +85,29 @@ fn relational_and_specialized_capabilities_are_not_flattened() {
         |capability| matches!(capability, Capability::SlowQueries(settings) if settings.configurable)
     ));
 }
+
+/// Cancellation is declared only where the driver tells the database to stop.
+///
+/// Every driver used to claim it while none issued a server-side cancel, so the
+/// capability carried no information at all.
+#[test]
+fn only_drivers_with_a_server_side_cancel_declare_it() {
+    let descriptors = builtin_descriptors();
+
+    for id in ["postgresql", "mysql"] {
+        assert!(
+            descriptor(&descriptors, id)
+                .capabilities
+                .supports(&Capability::Cancellation),
+            "{id} issues a native cancel and must declare it"
+        );
+    }
+    for id in ["sqlite", "mongodb", "redis"] {
+        assert!(
+            !descriptor(&descriptors, id)
+                .capabilities
+                .supports(&Capability::Cancellation),
+            "{id} only cancels client-side and must not claim otherwise"
+        );
+    }
+}
